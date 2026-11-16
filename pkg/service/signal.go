@@ -100,6 +100,11 @@ func (s *defaultSessionHandler) HandleSession(
 ) error {
 	prometheus.IncrementParticipantRtcInit(1)
 
+	if routing.HasParticipantPlacer(s.router) {
+		// distributed rooms: the participant was placed on this node by the signal node
+		return s.roomManager.StartSession(ctx, pi, requestSource, responseSink, false)
+	}
+
 	rtcNode, err := s.router.GetNodeForRoom(ctx, livekit.RoomName(pi.CreateRoom.Name))
 	if err != nil {
 		return err

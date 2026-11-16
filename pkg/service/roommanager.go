@@ -50,6 +50,7 @@ import (
 
 	"github.com/livekit/livekit-server/pkg/clientconfiguration"
 	"github.com/livekit/livekit-server/pkg/config"
+	"github.com/livekit/livekit-server/pkg/distributed"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/rtc"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
@@ -104,6 +105,8 @@ type RoomManager struct {
 	forwardStats *sfu.ForwardStats
 
 	subscribePacer *rtc.SubscribePacer
+
+	distributed *distributed.Manager // nil unless distributed rooms are enabled
 
 	rpc.UnimplementedParticipantServer
 	rpc.UnimplementedRoomServer
@@ -182,6 +185,11 @@ func NewLocalRoomManager(
 		return nil, err
 	}
 
+	if r.distributed, err = distributed.NewManager(conf, rtcConf, currentNode, router, bus); err != nil {
+		return nil, err
+	}
+	r.distributed.OnFailedNodeParticipant(r.cleanupFailedNodeParticipant)
+
 	return r, nil
 }
 
@@ -251,6 +259,7 @@ func (r *RoomManager) Stop() {
 	for _, room := range rooms {
 		room.Close(types.RoomCloseReasonServerShutdown)
 	}
+	r.distributed.Stop()
 
 	r.roomManagerServer.Kill()
 	r.whipServer.Kill()
@@ -682,6 +691,8 @@ func (r *RoomManager) getOrCreateRoom(ctx context.Context, createRoom *livekit.C
 		currentRoom = r.rooms[roomName]
 	}
 
+	internal = r.distributed.PrepareRoomInternal(ctx, roomName, internal)
+
 	// construct ice servers
 	newRoom := rtc.NewRoom(ri, internal, *r.rtcConfig, r.config.Room, &r.config.Audio, r.serverInfo, r.telemetry, r.agentClient, r.agentStore, r.egressLauncher)
 
@@ -707,22 +718,35 @@ func (r *RoomManager) getOrCreateRoom(ctx context.Context, createRoom *livekit.C
 		killDispServer()
 
 		roomInfo := newRoom.ToProto()
-		r.telemetry.RoomEnded(ctx, roomInfo, reason.ToProto())
+		// a distributed room ends when its last node closes it
+		lastNode := r.distributed.DetachRoom(ctx, newRoom, reason)
+		if lastNode {
+			r.telemetry.RoomEnded(ctx, roomInfo, reason.ToProto())
+		}
 		prometheus.RoomEnded(time.Unix(roomInfo.CreationTime, 0))
-		if err := r.deleteRoom(ctx, roomName); err != nil {
-			newRoom.Logger().Errorw("could not delete room", err)
+		if lastNode {
+			if err := r.deleteRoom(ctx, roomName); err != nil {
+				newRoom.Logger().Errorw("could not delete room", err)
+			}
+		} else {
+			r.removeLocalRoom(newRoom)
 		}
 
 		newRoom.Logger().Infow("room closed")
 	})
 
 	newRoom.OnRoomUpdated(func() {
+		r.distributed.OnRoomUpdated(newRoom)
 		if err := r.roomStore.StoreRoom(ctx, newRoom.ToProto(), newRoom.Internal()); err != nil {
 			newRoom.Logger().Errorw("could not handle metadata update", err)
 		}
 	})
 
 	newRoom.OnParticipantChanged(func(p types.Participant) {
+		r.distributed.OnParticipantChanged(newRoom, p)
+		if rtc.IsRemoteParticipant(p) {
+			return
+		}
 		if !p.IsDisconnected() {
 			if err := r.roomStore.StoreParticipant(ctx, roomName, p.ToProto()); err != nil {
 				newRoom.Logger().Errorw("could not handle participant change", err)
@@ -734,9 +758,13 @@ func (r *RoomManager) getOrCreateRoom(ctx context.Context, createRoom *livekit.C
 
 	r.lock.Unlock()
 
+	firstNode := r.distributed.AttachRoom(ctx, newRoom)
+
 	newRoom.Hold()
 
-	r.telemetry.RoomStarted(ctx, newRoom.ToProto())
+	if firstNode {
+		r.telemetry.RoomStarted(ctx, newRoom.ToProto())
+	}
 	prometheus.RoomStarted()
 
 	if created && createRoom.GetEgress().GetRoom() != nil {
@@ -838,6 +866,9 @@ func (r *RoomManager) ListParticipants(ctx context.Context, req *livekit.ListPar
 	for _, p := range participants {
 		items = append(items, p.ToProto())
 	}
+	for _, p := range room.GetRemoteParticipants() {
+		items = append(items, p.ToProto())
+	}
 
 	return &livekit.ListParticipantsResponse{
 		Participants: items,
@@ -852,6 +883,9 @@ func (r *RoomManager) GetParticipant(ctx context.Context, req *livekit.RoomParti
 
 	participant := room.GetParticipant(livekit.ParticipantIdentity(req.Identity))
 	if participant == nil {
+		if rp := room.GetRemoteParticipant(livekit.ParticipantIdentity(req.Identity)); rp != nil {
+			return rp.ToProto(), nil
+		}
 		return nil, ErrParticipantNotFound
 	}
 

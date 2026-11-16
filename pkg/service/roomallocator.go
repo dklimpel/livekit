@@ -143,7 +143,8 @@ func (r *StandardRoomAllocator) SelectRoomNode(ctx context.Context, roomName liv
 	// if already assigned and still available, keep it on that node
 	if err == nil && selector.IsAvailable(existing) {
 		// if node hosting the room is full, deny entry
-		if selector.LimitsReached(r.config.Limit, existing.Stats) {
+		// distributed rooms overflow to other nodes instead
+		if selector.LimitsReached(r.config.Limit, existing.Stats) && !r.config.Distributed.Enabled {
 			return routing.ErrNodeLimitReached
 		}
 

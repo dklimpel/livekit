@@ -54,6 +54,8 @@ type RedisRouter struct {
 	isStarted atomic.Bool
 
 	cancel func()
+
+	placer ParticipantPlacer // distributed rooms, see distributed_hook.go
 }
 
 func NewRedisRouter(lr *LocalRouter, rc redis.UniversalClient, kps rpc.KeepalivePubSub) *RedisRouter {
@@ -98,7 +100,10 @@ func (r *RedisRouter) RemoveDeadNodes() error {
 }
 
 // GetNodeForRoom finds the node where the room is hosted at
-func (r *RedisRouter) GetNodeForRoom(_ context.Context, roomName livekit.RoomName) (*livekit.Node, error) {
+func (r *RedisRouter) GetNodeForRoom(ctx context.Context, roomName livekit.RoomName) (*livekit.Node, error) {
+	if r.placer != nil {
+		return r.placer.NodeForRoom(ctx, roomName)
+	}
 	nodeID, err := r.rc.HGet(r.ctx, NodeRoomKey, string(roomName)).Result()
 	if err == redis.Nil {
 		return nil, ErrNotFound
@@ -161,6 +166,9 @@ func (r *RedisRouter) CreateRoom(ctx context.Context, req *livekit.CreateRoomReq
 
 // StartParticipantSignal signal connection sets up paths to the RTC node, and starts to route messages to that message queue
 func (r *RedisRouter) StartParticipantSignal(ctx context.Context, roomName livekit.RoomName, pi ParticipantInit) (res StartParticipantSignalResults, err error) {
+	if r.placer != nil {
+		return r.startParticipantSignalWithPlacer(ctx, roomName, pi)
+	}
 	rtcNode, err := r.GetNodeForRoom(ctx, roomName)
 	if err != nil {
 		return

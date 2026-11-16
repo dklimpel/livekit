@@ -152,6 +152,8 @@ type Room struct {
 	onStateChangeMu              sync.Mutex
 	localParticipantListener     types.LocalParticipantListener
 	participantTelemetryListener types.ParticipantTelemetryListener
+
+	distributed roomDistributedState // see room_distributed.go
 }
 
 type ParticipantOptions struct {
@@ -381,7 +383,10 @@ func (r *Room) GetParticipantCount() int {
 }
 
 func (r *Room) GetActiveSpeakers() []*livekit.SpeakerInfo {
-	participants := r.GetParticipants()
+	return r.getActiveSpeakers(r.getParticipantsIncludingRemote())
+}
+
+func (r *Room) getActiveSpeakers(participants []types.Participant) []*livekit.SpeakerInfo {
 	speakers := make([]*livekit.SpeakerInfo, 0, len(participants))
 	for _, p := range participants {
 		level, active := p.GetAudioLevel()
@@ -456,7 +461,7 @@ func (r *Room) Join(
 		return ErrAlreadyJoined
 	}
 	if r.protoRoom.MaxParticipants > 0 && !participant.IsDependent() {
-		numParticipants := uint32(0)
+		numParticipants := r.numRemoteParticipantsLocked()
 		for _, p := range r.participants {
 			if !p.IsDependent() {
 				numParticipants++
@@ -710,6 +715,7 @@ func (r *Room) onUpdateSubscriptionPermission(participant types.LocalParticipant
 	for _, track := range participant.GetPublishedDataTracks() {
 		r.trackManager.NotifyTrackChanged(track.ID())
 	}
+	r.notifyDistributedPermissionChanged(participant)
 	return nil
 }
 
@@ -728,7 +734,7 @@ func (r *Room) ResolveMediaTrackForSubscriber(sub types.LocalParticipant, trackI
 	res.PublisherIdentity = info.PublisherIdentity
 	res.PublisherID = info.PublisherID
 
-	pub := r.GetParticipantByID(info.PublisherID)
+	pub := r.getParticipantByIDIncludingRemote(info.PublisherID)
 	// when publisher is not found, we will assume it doesn't have permission to access
 	if pub != nil {
 		res.HasPermission = IsParticipantExemptFromTrackPermissionsRestrictions(sub) || pub.HasPermission(trackID, sub.Identity())
@@ -752,7 +758,7 @@ func (r *Room) ResolveDataTrackForSubscriber(sub types.LocalParticipant, trackID
 	res.PublisherIdentity = info.PublisherIdentity
 	res.PublisherID = info.PublisherID
 
-	pub := r.GetParticipantByID(info.PublisherID)
+	pub := r.getParticipantByIDIncludingRemote(info.PublisherID)
 	// when publisher is not found, we will assume it doesn't have permission to access
 	if pub != nil {
 		res.HasPermission = IsParticipantExemptFromTrackPermissionsRestrictions(sub) || pub.HasPermission(trackID, sub.Identity())
@@ -1053,7 +1059,7 @@ func (r *Room) createJoinResponseLocked(
 		OtherParticipants: GetOtherParticipantInfo(
 			participant,
 			false, // isMigratingIn
-			toParticipants(slices.Collect(maps.Values(r.participants))),
+			r.appendRemoteParticipantsLocked(toParticipants(slices.Collect(maps.Values(r.participants)))),
 			false, // skipSubscriberBroadcast
 		),
 		IceServers: iceServers,
@@ -1107,6 +1113,11 @@ func (r *Room) onTrackPublished(participant types.Participant, track types.Media
 
 	if onParticipantChanged != nil {
 		onParticipantChanged(participant)
+	}
+
+	if IsRemoteParticipant(participant) {
+		// agents and egress are launched by the node hosting the publisher
+		return
 	}
 
 	// launch jobs
@@ -1304,6 +1315,7 @@ func (r *Room) onDataMessage(source types.LocalParticipant, kind livekit.DataPac
 		}, len(data))
 	}
 	BroadcastDataPacketForRoom(r, source, kind, dp, r.logger)
+	r.notifyDistributedLocalData(source, kind, dp)
 }
 
 func (r *Room) onDataMessageUnlabeled(source types.LocalParticipant, data []byte) {
@@ -1509,7 +1521,7 @@ func (r *Room) subscribeToExistingTracks(p types.LocalParticipant, isSync bool) 
 	r.lock.RUnlock()
 
 	var trackIDs []livekit.TrackID
-	for _, op := range r.GetParticipants() {
+	for _, op := range r.getParticipantsIncludingRemote() {
 		if p.ID() == op.ID() {
 			// don't send to itself
 			continue
@@ -1601,6 +1613,7 @@ func (r *Room) updateProto() *livekit.Room {
 			room.NumPublishers++
 		}
 	}
+	r.addRemoteParticipantCounts(room)
 
 	return room
 }

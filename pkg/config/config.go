@@ -121,6 +121,8 @@ type Config struct {
 	EnableParticipantDataBlob bool `yaml:"enable_participant_data_blob,omitempty"`
 
 	API APIConfig `yaml:"api,omitempty"`
+
+	Distributed DistributedConfig `yaml:"distributed,omitempty"`
 }
 
 // WebTransportConfig is the node's HTTP/3 listener. QUIC has no plaintext mode,
