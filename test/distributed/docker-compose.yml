@@ -1,0 +1,159 @@
+# Local test cluster for distributed rooms: Redis + 3 LiveKit nodes.
+# See README.md in this directory.
+#
+#   docker compose up -d --build
+#
+# Ports on the host (identical inside the containers, so ICE candidates work):
+#   livekit-1: 7880 (http/ws), 7881/tcp, 7882/udp
+#   livekit-2: 7980 (http/ws), 7981/tcp, 7982/udp
+#   livekit-3: 8080 (http/ws), 8081/tcp, 8082/udp
+#   redis:     6379
+#   web:       8090 (browser test page)
+# The relay between the nodes uses 7890-7989/udp on the internal network only.
+
+x-livekit: &livekit
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  image: livekit-server-distributed:dev
+  depends_on:
+    - redis
+  restart: "no"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      lknet:
+        ipv4_address: 172.28.0.10
+
+  livekit-1:
+    <<: *livekit
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+    networks:
+      lknet:
+        ipv4_address: 172.28.0.11
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7880
+        log_level: ${LOG_LEVEL:-info}
+        redis:
+          address: redis:6379
+        rtc:
+          tcp_port: 7881
+          udp_port: 7882
+          use_external_ip: false
+          node_ip: 127.0.0.1
+        keys:
+          devkey: secretsecretsecretsecretsecretsecret
+        room:
+          auto_create: true
+          empty_timeout: 60
+          departure_timeout: 20
+        distributed:
+          enabled: true
+          max_participants_per_node: ${MAX_PER_NODE:-1}
+          relay:
+            port_range_start: 7890
+            port_range_end: 7989
+            node_ip: 172.28.0.11
+
+  livekit-2:
+    <<: *livekit
+    ports:
+      - "7980:7980"
+      - "7981:7981"
+      - "7982:7982/udp"
+    networks:
+      lknet:
+        ipv4_address: 172.28.0.12
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7980
+        log_level: ${LOG_LEVEL:-info}
+        redis:
+          address: redis:6379
+        rtc:
+          tcp_port: 7981
+          udp_port: 7982
+          use_external_ip: false
+          node_ip: 127.0.0.1
+        keys:
+          devkey: secretsecretsecretsecretsecretsecret
+        room:
+          auto_create: true
+          empty_timeout: 60
+          departure_timeout: 20
+        distributed:
+          enabled: true
+          max_participants_per_node: ${MAX_PER_NODE:-1}
+          relay:
+            port_range_start: 7890
+            port_range_end: 7989
+            node_ip: 172.28.0.12
+
+  livekit-3:
+    <<: *livekit
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+      - "8082:8082/udp"
+    networks:
+      lknet:
+        ipv4_address: 172.28.0.13
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 8080
+        log_level: ${LOG_LEVEL:-info}
+        redis:
+          address: redis:6379
+        rtc:
+          tcp_port: 8081
+          udp_port: 8082
+          use_external_ip: false
+          node_ip: 127.0.0.1
+        keys:
+          devkey: secretsecretsecretsecretsecretsecret
+        room:
+          auto_create: true
+          empty_timeout: 60
+          departure_timeout: 20
+        distributed:
+          enabled: true
+          max_participants_per_node: ${MAX_PER_NODE:-1}
+          relay:
+            port_range_start: 7890
+            port_range_end: 7989
+            node_ip: 172.28.0.13
+
+  # browser test page, http://localhost:8090
+  web:
+    image: nginx:alpine
+    ports:
+      - "8090:80"
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+    networks:
+      - lknet
+
+  # LiveKit CLI, e.g.: docker compose run --rm lk room list
+  # Uses the host network so that it reaches the nodes like a regular client.
+  lk:
+    image: ${LK_IMAGE:-livekit/livekit-cli:latest}
+    profiles: ["tools"]
+    network_mode: host
+    environment:
+      LIVEKIT_URL: ws://localhost:7880
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: secretsecretsecretsecretsecretsecret
+
+networks:
+  lknet:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

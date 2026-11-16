@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distributed Room Test</title>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.5.0/dist/livekit-client.umd.min.js"></script>
+<style>
+  :root { --bg: #f6f7f9; --fg: #1d2330; --muted: #6a7282; --card: #fff; --border: #d9dde4; --accent: #2f6fde; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --fg: #e6e9ef; --muted: #98a0ad; --card: #1d2128; --border: #313743; --accent: #6c9cf0; }
+  }
+  body { margin: 0; padding: 16px; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  form { display: grid; gap: 8px; max-width: 720px; }
+  label { color: var(--muted); font-size: 12px; }
+  select, textarea, button { font: inherit; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--fg); }
+  textarea { height: 60px; width: 100%; box-sizing: border-box; }
+  button { background: var(--accent); color: #fff; border: none; cursor: pointer; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; margin-top: 16px; }
+  .tile { background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .tile video { width: 100%; aspect-ratio: 16/9; background: #000; display: block; }
+  .tile .name { padding: 4px 8px; font-size: 12px; }
+  .tile.speaking { outline: 2px solid var(--accent); }
+  #log { margin-top: 16px; font: 12px/1.4 ui-monospace, monospace; color: var(--muted); white-space: pre-wrap; max-height: 200px; overflow: auto; }
+</style>
+</head>
+<body>
+<h1>Distributed room test</h1>
+<form id="f">
+  <div>
+    <label for="url">Signal node</label><br>
+    <select id="url">
+      <option value="ws://localhost:7880">livekit-1 (ws://localhost:7880)</option>
+      <option value="ws://localhost:7980">livekit-2 (ws://localhost:7980)</option>
+      <option value="ws://localhost:8080">livekit-3 (ws://localhost:8080)</option>
+    </select>
+  </div>
+  <div>
+    <label for="token">Token (see README: lk token create)</label>
+    <textarea id="token"></textarea>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="cam" checked> camera</label>
+    <label><input type="checkbox" id="mic" checked> microphone</label>
+    <button type="submit" id="connect">Connect</button>
+    <button type="button" id="leave">Leave</button>
+  </div>
+</form>
+<div id="grid"></div>
+<div id="log"></div>
+<script>
+const LK = LivekitClient;
+let room;
+const $ = (id) => document.getElementById(id);
+const log = (msg) => { $('log').textContent = new Date().toLocaleTimeString() + ' ' + msg + '\n' + $('log').textContent; };
+
+function tile(p) {
+  let el = document.querySelector(`[data-p="${p.identity}"]`);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'tile';
+    el.dataset.p = p.identity;
+    el.innerHTML = '<video autoplay playsinline muted></video><div class="name"></div>';
+    $('grid').appendChild(el);
+  }
+  el.querySelector('.name').textContent = p.identity + (p instanceof LK.LocalParticipant ? ' (you)' : '');
+  return el;
+}
+
+$('f').onsubmit = async (e) => {
+  e.preventDefault();
+  room = new LK.Room({ adaptiveStream: true, dynacast: true });
+  room
+    .on(LK.RoomEvent.ParticipantConnected, (p) => { tile(p); log('joined: ' + p.identity); })
+    .on(LK.RoomEvent.ParticipantDisconnected, (p) => { tile(p).remove(); log('left: ' + p.identity); })
+    .on(LK.RoomEvent.TrackSubscribed, (track, pub, p) => {
+      log(`subscribed ${track.kind} of ${p.identity}`);
+      if (track.kind === 'video') track.attach(tile(p).querySelector('video'));
+      else document.body.appendChild(track.attach());
+    })
+    .on(LK.RoomEvent.TrackUnsubscribed, (track) => track.detach().forEach((el) => el.tagName === 'AUDIO' && el.remove()))
+    .on(LK.RoomEvent.ActiveSpeakersChanged, (speakers) => {
+      document.querySelectorAll('.tile').forEach((t) => t.classList.toggle('speaking', speakers.some((s) => s.identity === t.dataset.p)));
+    })
+    .on(LK.RoomEvent.DataReceived, (data, p) => log(`data from ${p?.identity}: ${new TextDecoder().decode(data)}`))
+    .on(LK.RoomEvent.Disconnected, () => log('disconnected'));
+
+  await room.connect($('url').value, $('token').value.trim());
+  log(`connected to ${room.name} via ${$('url').value} as ${room.localParticipant.identity}`);
+  room.remoteParticipants.forEach((p) => tile(p));
+  const lp = tile(room.localParticipant);
+  if ($('cam').checked) {
+    const pub = await room.localParticipant.setCameraEnabled(true);
+    pub?.videoTrack?.attach(lp.querySelector('video'));
+  }
+  if ($('mic').checked) await room.localParticipant.setMicrophoneEnabled(true);
+};
+$('leave').onclick = () => { room?.disconnect(); $('grid').innerHTML = ''; };
+</script>
+</body>
+</html>
