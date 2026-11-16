@@ -1,0 +1,3540 @@
+diff --git a/pkg/distributed/distributed_test.go b/pkg/distributed/distributed_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9d1da8ed2ff845dd55908443df2d1df35560905
+--- /dev/null
++++ b/pkg/distributed/distributed_test.go
+@@ -0,0 +1,268 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++
++	"github.com/livekit/protocol/codecs/mime"
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/logger"
++
++	"github.com/livekit/livekit-server/pkg/config"
++	"github.com/livekit/livekit-server/pkg/routing"
++	"github.com/livekit/livekit-server/pkg/routing/selector"
++	"github.com/livekit/livekit-server/pkg/rtc"
++)
++
++func testNode(id string, cpu float32) *livekit.Node {
++	return &livekit.Node{
++		Id:    id,
++		State: livekit.NodeState_SERVING,
++		Stats: &livekit.NodeStats{UpdatedAt: time.Now().Unix(), CpuLoad: cpu, NumCpus: 4},
++	}
++}
++
++func testPlacer(t *testing.T, maxPerNode int) *Placer {
++	conf := &config.Config{Distributed: config.DistributedConfig{Enabled: true, MaxParticipantsPerNode: maxPerNode}}
++	conf.NodeSelector.SortBy = "random"
++	conf.NodeSelector.Algorithm = "lowest"
++	sel, err := selector.CreateNodeSelector(conf)
++	require.NoError(t, err)
++	return &Placer{conf: conf.Distributed, limits: conf.Limit, selector: sel, logger: logger.GetLogger()}
++}
++
++func testState(nodes []*livekit.Node, roomNodes []livekit.NodeID, counts map[livekit.NodeID]int) *placementState {
++	st := &placementState{
++		available: make(map[livekit.NodeID]*livekit.Node),
++		roomNodes: roomNodes,
++		counts:    counts,
++	}
++	for _, n := range nodes {
++		st.available[livekit.NodeID(n.Id)] = n
++	}
++	return st
++}
++
++func TestPlacementFillThenOverflow(t *testing.T) {
++	p := testPlacer(t, 2)
++	nodes := []*livekit.Node{testNode("A", 0.1), testNode("B", 0.1), testNode("C", 0.1)}
++
++	t.Run("new room picks any node", func(t *testing.T) {
++		node, reason, err := p.pick(testState(nodes, nil, map[livekit.NodeID]int{}))
++		require.NoError(t, err)
++		require.NotNil(t, node)
++		require.Equal(t, "new", reason)
++	})
++
++	t.Run("fills the room node below its limit", func(t *testing.T) {
++		node, reason, err := p.pick(testState(nodes, []livekit.NodeID{"A"}, map[livekit.NodeID]int{"A": 1}))
++		require.NoError(t, err)
++		require.Equal(t, "A", node.Id)
++		require.Equal(t, "fill", reason)
++	})
++
++	t.Run("prefers the fullest room node", func(t *testing.T) {
++		p := testPlacer(t, 10)
++		node, _, err := p.pick(testState(nodes, []livekit.NodeID{"A", "B"}, map[livekit.NodeID]int{"A": 3, "B": 7}))
++		require.NoError(t, err)
++		require.Equal(t, "B", node.Id)
++	})
++
++	t.Run("overflows to a node outside the room", func(t *testing.T) {
++		node, reason, err := p.pick(testState(nodes, []livekit.NodeID{"A", "B"}, map[livekit.NodeID]int{"A": 2, "B": 2}))
++		require.NoError(t, err)
++		require.Equal(t, "C", node.Id)
++		require.Equal(t, "overflow", reason)
++	})
++
++	t.Run("everything full", func(t *testing.T) {
++		_, _, err := p.pick(testState(nodes, []livekit.NodeID{"A", "B", "C"}, map[livekit.NodeID]int{"A": 2, "B": 2, "C": 2}))
++		require.ErrorIs(t, err, routing.ErrNodeLimitReached)
++	})
++
++	t.Run("dead room node is skipped", func(t *testing.T) {
++		// "A" is a room node, but not available (missing from the available nodes)
++		node, reason, err := p.pick(testState(nodes[1:], []livekit.NodeID{"A"}, map[livekit.NodeID]int{"A": 1}))
++		require.NoError(t, err)
++		require.NotEqual(t, "A", node.Id)
++		require.Equal(t, "overflow", reason)
++	})
++}
++
++func TestPlacementCPULimit(t *testing.T) {
++	p := testPlacer(t, 0)
++	p.conf.CPULoadLimit = 0.8
++	nodes := []*livekit.Node{testNode("A", 0.9), testNode("B", 0.2)}
++
++	node, reason, err := p.pick(testState(nodes, []livekit.NodeID{"A"}, map[livekit.NodeID]int{"A": 1}))
++	require.NoError(t, err)
++	require.Equal(t, "B", node.Id)
++	require.Equal(t, "overflow", reason)
++}
++
++func TestRelayStreamID(t *testing.T) {
++	id := relayStreamID("TR_abc", mime.MimeTypeVP8, 2)
++	trackID, mimeType, idx, ok := parseRelayStreamID(id)
++	require.True(t, ok)
++	require.Equal(t, livekit.TrackID("TR_abc"), trackID)
++	require.Equal(t, mime.MimeTypeVP8, mimeType)
++	require.Equal(t, 2, idx)
++
++	_, _, _, ok = parseRelayStreamID("garbage")
++	require.False(t, ok)
++}
++
++func TestMessageRoundTrip(t *testing.T) {
++	info := &livekit.ParticipantInfo{Sid: "PA_1", Identity: "alice", Version: 3}
++	data, err := encodeForTest(&message{Type: msgParticipantUpdate, Node: "N1", Room: "room", Participant: marshalProto(info)})
++	require.NoError(t, err)
++
++	msg, err := decode(data)
++	require.NoError(t, err)
++	require.Equal(t, msgParticipantUpdate, msg.Type)
++	require.Equal(t, livekit.NodeID("N1"), msg.Node)
++	require.NotEmpty(t, msg.Participant)
++}
++
++func TestRemoteParticipant(t *testing.T) {
++	info := &livekit.ParticipantInfo{
++		Sid:         "PA_1",
++		Identity:    "alice",
++		State:       livekit.ParticipantInfo_ACTIVE,
++		Version:     5,
++		IsPublisher: true,
++		Permission:  &livekit.ParticipantPermission{Hidden: true},
++	}
++	rp := newRemoteParticipant("N1", info, logger.GetLogger())
++	require.True(t, rtc.IsRemoteParticipant(rp))
++	require.Equal(t, livekit.ParticipantIdentity("alice"), rp.Identity())
++	require.True(t, rp.Hidden())
++	require.True(t, rp.IsPublisher())
++
++	t.Run("outdated updates are ignored", func(t *testing.T) {
++		require.False(t, rp.update(&livekit.ParticipantInfo{Sid: "PA_1", Identity: "alice", Version: 4}, nil))
++		require.True(t, rp.update(&livekit.ParticipantInfo{Sid: "PA_1", Identity: "alice", Version: 6, State: livekit.ParticipantInfo_ACTIVE}, nil))
++	})
++
++	t.Run("permissions", func(t *testing.T) {
++		require.True(t, rp.HasPermission("TR_1", "bob"))
++		rp.update(&livekit.ParticipantInfo{Sid: "PA_1", Identity: "alice", Version: 7}, &livekit.SubscriptionPermission{
++			TrackPermissions: []*livekit.TrackPermission{
++				{ParticipantIdentity: "bob", TrackSids: []string{"TR_1"}},
++				{ParticipantIdentity: "carol", AllTracks: true},
++			},
++		})
++		require.True(t, rp.HasPermission("TR_1", "bob"))
++		require.False(t, rp.HasPermission("TR_2", "bob"))
++		require.True(t, rp.HasPermission("TR_2", "carol"))
++		require.False(t, rp.HasPermission("TR_1", "dave"))
++	})
++
++	t.Run("audio level times out", func(t *testing.T) {
++		rp.setAudioLevel(0.5, true)
++		level, active := rp.GetAudioLevel()
++		require.True(t, active)
++		require.Equal(t, 0.5, level)
++
++		rp.lock.Lock()
++		rp.audioAt = time.Now().Add(-2 * remoteSpeakerTimeout)
++		rp.lock.Unlock()
++		_, active = rp.GetAudioLevel()
++		require.False(t, active)
++	})
++
++	t.Run("disconnect", func(t *testing.T) {
++		before := rp.ToProto().Version
++		require.NoError(t, rp.Close(false, 0, false))
++		require.True(t, rp.IsDisconnected())
++		require.Equal(t, livekit.ParticipantInfo_DISCONNECTED, rp.ToProto().State)
++		require.Greater(t, rp.ToProto().Version, before)
++	})
++}
++
++func encodeForTest(msg *message) (*wrapperspb.BytesValue, error) {
++	data, err := json.Marshal(msg)
++	if err != nil {
++		return nil, err
++	}
++	return wrapperspb.Bytes(data), nil
++}
++
++func TestRelayNodeIP(t *testing.T) {
++	ip, source, err := relayNodeIP("10.0.0.1", "10.0.0.2", "1.2.3.4")
++	require.NoError(t, err)
++	require.Equal(t, "10.0.0.1", ip)
++	require.Equal(t, "config", source)
++
++	ip, source, err = relayNodeIP("", "10.0.0.2", "1.2.3.4")
++	require.NoError(t, err)
++	require.Equal(t, "10.0.0.2", ip)
++	require.Equal(t, RelayNodeIPEnv, source)
++
++	ip, _, err = relayNodeIP("", "", "1.2.3.4")
++	require.NoError(t, err)
++	require.Equal(t, "1.2.3.4", ip)
++
++	_, _, err = relayNodeIP("", "not-an-ip", "1.2.3.4")
++	require.Error(t, err)
++	_, _, err = relayNodeIP("", "fd00::1", "1.2.3.4")
++	require.Error(t, err)
++}
++
++func TestRelayTrackInfo(t *testing.T) {
++	ti := &livekit.TrackInfo{
++		Sid:    "TR_1",
++		Layers: []*livekit.VideoLayer{{Quality: livekit.VideoQuality_LOW, Ssrc: 1, RepairSsrc: 2, Rid: "q"}},
++		Codecs: []*livekit.SimulcastCodecInfo{{
++			MimeType: "video/VP8",
++			Layers:   []*livekit.VideoLayer{{Quality: livekit.VideoQuality_HIGH, Ssrc: 3, Rid: "f"}},
++		}},
++	}
++	rti := relayTrackInfo(ti)
++	require.Zero(t, rti.Layers[0].Ssrc)
++	require.Zero(t, rti.Layers[0].RepairSsrc)
++	require.Equal(t, "q", rti.Layers[0].Rid)
++	require.Zero(t, rti.Codecs[0].Layers[0].Ssrc)
++	// the original is not modified
++	require.Equal(t, uint32(1), ti.Layers[0].Ssrc)
++	require.Equal(t, uint32(3), ti.Codecs[0].Layers[0].Ssrc)
++}
++
++func TestRelayPortRange(t *testing.T) {
++	start, end, err := relayPortRange(config.DistributedRelayConfig{})
++	require.NoError(t, err)
++	require.Equal(t, uint16(7890), start)
++	require.Equal(t, uint16(8889), end)
++
++	start, end, err = relayPortRange(config.DistributedRelayConfig{PortRangeStart: 20000, PortRangeEnd: 20099})
++	require.NoError(t, err)
++	require.Equal(t, uint16(20000), start)
++	require.Equal(t, uint16(20099), end)
++
++	// deprecated udp_port becomes the start of the range
++	start, end, err = relayPortRange(config.DistributedRelayConfig{UDPPort: 9000})
++	require.NoError(t, err)
++	require.Equal(t, uint16(9000), start)
++	require.Equal(t, uint16(9999), end)
++
++	_, _, err = relayPortRange(config.DistributedRelayConfig{PortRangeStart: 9000, PortRangeEnd: 8000})
++	require.Error(t, err)
++}
+diff --git a/pkg/distributed/manager.go b/pkg/distributed/manager.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..306cd1f18e9a9103b1c4e88852ed609bd2da9126
+--- /dev/null
++++ b/pkg/distributed/manager.go
+@@ -0,0 +1,402 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package distributed hosts a single LiveKit room on multiple nodes.
++//
++// Every node hosting a part of a room runs a regular rtc.Room with its local
++// participants. Participants on other nodes are mirrored into the local room
++// as remote participants, their tracks are pulled on demand over a WebRTC
++// relay connection between the nodes. See docs/distributed-rooms.
++package distributed
++
++import (
++	"context"
++	"errors"
++	"os"
++	"sync"
++	"time"
++
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/logger"
++	"github.com/livekit/psrpc"
++	"github.com/livekit/psrpc/pkg/bus"
++
++	"github.com/livekit/livekit-server/pkg/config"
++	"github.com/livekit/livekit-server/pkg/routing"
++	"github.com/livekit/livekit-server/pkg/routing/selector"
++	"github.com/livekit/livekit-server/pkg/rtc"
++	"github.com/livekit/livekit-server/pkg/rtc/types"
++)
++
++var ErrRedisRequired = errors.New("distributed rooms require redis")
++
++const (
++	defaultNodeCheckInterval = 2 * time.Second
++	detachTimeout            = 5 * time.Second
++	relayAddressInterval     = 30 * time.Second
++)
++
++// Manager is the entry point of the distributed room implementation on a node.
++// All methods are safe to call on a nil Manager, which is what callers get
++// when distributed rooms are disabled.
++type Manager struct {
++	conf        config.DistributedConfig
++	fullConf    *config.Config
++	rtcConf     *rtc.WebRTCConfig
++	currentNode routing.LocalNode
++	router      routing.Router
++	store       *Store
++	placer      *Placer
++	bus         psrpc.MessageBus
++	relay       *relayTransport
++	logger      logger.Logger
++
++	lock  sync.Mutex
++	rooms map[livekit.RoomName]*roomState
++
++	onFailedNodeParticipant func(ctx context.Context, roomName livekit.RoomName, pi *livekit.ParticipantInfo)
++
++	ctx    context.Context
++	cancel context.CancelFunc
++}
++
++// NewManager returns nil when distributed rooms are disabled.
++func NewManager(
++	conf *config.Config,
++	rtcConf *rtc.WebRTCConfig,
++	currentNode routing.LocalNode,
++	router routing.Router,
++	bus psrpc.MessageBus,
++) (*Manager, error) {
++	if !conf.Distributed.Enabled {
++		return nil, nil
++	}
++	rr, ok := router.(*routing.RedisRouter)
++	if !ok || rr.RedisClient() == nil {
++		return nil, ErrRedisRequired
++	}
++
++	dc := conf.Distributed
++	if dc.NodeCheckInterval <= 0 {
++		dc.NodeCheckInterval = defaultNodeCheckInterval
++	}
++
++	store := NewStore(rr.RedisClient())
++	placer, err := NewPlacer(conf, store, rr.RedisClient(), router)
++	if err != nil {
++		return nil, err
++	}
++	rr.SetParticipantPlacer(placer)
++
++	m := &Manager{
++		conf:        dc,
++		fullConf:    conf,
++		rtcConf:     rtcConf,
++		currentNode: currentNode,
++		router:      router,
++		store:       store,
++		placer:      placer,
++		bus:         bus,
++		logger:      logger.GetLogger().WithComponent("distributed").WithValues("nodeID", currentNode.NodeID()),
++		rooms:       make(map[livekit.RoomName]*roomState),
++	}
++	m.ctx, m.cancel = context.WithCancel(context.Background())
++
++	relayIP, relayIPSource, err := relayNodeIP(dc.Relay.NodeIP, os.Getenv(RelayNodeIPEnv), currentNode.NodeIP())
++	if err != nil {
++		m.cancel()
++		return nil, err
++	}
++	m.logger.Infow("relay node ip", "ip", relayIP, "source", relayIPSource)
++	if m.relay, err = newRelayTransport(dc.Relay, relayIP, rtcConf, m.logger); err != nil {
++		m.cancel()
++		return nil, err
++	}
++
++	if err := store.SetNodeRelayAddress(m.ctx, currentNode.NodeID(), m.relay.address()); err != nil {
++		m.logger.Warnw("could not register relay address", err)
++	}
++
++	sub, err := subscribe(m.ctx, bus, nodeChannel(currentNode.NodeID()))
++	if err != nil {
++		m.cancel()
++		m.relay.close()
++		return nil, err
++	}
++	go m.nodeReadWorker(sub)
++	go m.relayAddressWorker()
++
++	m.logger.Infow("distributed rooms enabled",
++		"maxParticipantsPerNode", dc.MaxParticipantsPerNode,
++		"cpuLoadLimit", dc.CPULoadLimit,
++	)
++	return m, nil
++}
++
++// OnFailedNodeParticipant registers a callback for participants removed because
++// their node failed. The callback cleans up state the failed node could not
++// clean up itself (e.g. the participant in the room store).
++func (m *Manager) OnFailedNodeParticipant(f func(ctx context.Context, roomName livekit.RoomName, pi *livekit.ParticipantInfo)) {
++	if m == nil {
++		return
++	}
++	m.onFailedNodeParticipant = f
++}
++
++func (m *Manager) Enabled() bool {
++	return m != nil
++}
++
++func (m *Manager) Stop() {
++	if m == nil {
++		return
++	}
++	m.cancel()
++
++	m.lock.Lock()
++	rooms := make([]*roomState, 0, len(m.rooms))
++	for _, rs := range m.rooms {
++		rooms = append(rooms, rs)
++	}
++	m.lock.Unlock()
++	for _, rs := range rooms {
++		rs.close()
++	}
++	_ = m.store.RemoveNodeRelayAddress(context.Background(), m.currentNode.NodeID())
++	m.relay.close()
++}
++
++// relayAddressWorker keeps this node's relay address registered and removes
++// the addresses of nodes that are gone (crashed, or replaced by a new pod).
++// Live nodes re-register every interval, so a node that is not registered in
++// the node registry yet is restored on its next run.
++func (m *Manager) relayAddressWorker() {
++	ticker := time.NewTicker(relayAddressInterval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-m.ctx.Done():
++			return
++		case <-ticker.C:
++		}
++
++		if err := m.store.SetNodeRelayAddress(m.ctx, m.currentNode.NodeID(), m.relay.address()); err != nil {
++			m.logger.Warnw("could not register relay address", err)
++			continue
++		}
++		nodes, err := m.router.ListNodes()
++		if err != nil {
++			continue
++		}
++		available := make(map[livekit.NodeID]bool, len(nodes))
++		for _, n := range nodes {
++			if selector.IsAvailable(n) {
++				available[livekit.NodeID(n.Id)] = true
++			}
++		}
++		available[m.currentNode.NodeID()] = true
++		removed, err := m.store.PruneNodeRelayAddresses(m.ctx, available)
++		if err != nil {
++			m.logger.Warnw("could not prune relay addresses", err)
++		} else if len(removed) > 0 {
++			m.logger.Debugw("removed relay addresses of unavailable nodes", "nodeIDs", removed)
++		}
++	}
++}
++
++// nodeReadWorker dispatches relay control messages addressed to this node.
++func (m *Manager) nodeReadWorker(sub bus.Subscription[*wrapperspb.BytesValue]) {
++	defer func() { _ = sub.Close() }()
++	for {
++		select {
++		case <-m.ctx.Done():
++			return
++		case v, ok := <-sub.Channel():
++			if !ok {
++				return
++			}
++			msg, err := decode(v)
++			if err != nil {
++				m.logger.Warnw("could not decode relay message", err)
++				continue
++			}
++			m.lock.Lock()
++			rs := m.rooms[msg.Room]
++			m.lock.Unlock()
++			if rs == nil {
++				m.logger.Debugw("relay message for unknown room", "room", msg.Room, "type", msg.Type)
++				continue
++			}
++			rs.handleRelayMessage(msg)
++		}
++	}
++}
++
++// PrepareRoomInternal is called before a node creates its rtc.Room for a room.
++// Room level agents are dispatched by one node of the room only.
++func (m *Manager) PrepareRoomInternal(ctx context.Context, roomName livekit.RoomName, internal *livekit.RoomInternal) *livekit.RoomInternal {
++	if m == nil || internal == nil || len(internal.AgentDispatches) == 0 {
++		return internal
++	}
++	claimed, err := m.store.ClaimRoomAgents(ctx, roomName, m.currentNode.NodeID())
++	if err != nil {
++		m.logger.Warnw("could not claim room agents", err, "room", roomName)
++	}
++	if claimed {
++		return internal
++	}
++	internal = proto.CloneOf(internal)
++	internal.AgentDispatches = nil
++	return internal
++}
++
++// AttachRoom is called after a node created its rtc.Room for a room. It
++// returns true when this node is the first node hosting the room (or
++// distributed rooms are disabled), i.e. when the room actually started.
++func (m *Manager) AttachRoom(ctx context.Context, room *rtc.Room) bool {
++	if m == nil {
++		return true
++	}
++	numNodes, err := m.store.AddRoomNode(ctx, room.Name(), m.currentNode.NodeID())
++	if err != nil {
++		room.Logger().Errorw("could not register room node", err)
++		numNodes = 1
++	}
++
++	rs := newRoomState(m, room)
++	m.lock.Lock()
++	if old := m.rooms[room.Name()]; old != nil {
++		defer old.close()
++	}
++	m.rooms[room.Name()] = rs
++	m.lock.Unlock()
++
++	rs.start()
++	room.Logger().Infow("room attached to distributed room", "numNodes", numNodes)
++	return numNodes == 1
++}
++
++// DetachRoom is called when the local rtc.Room closed. It returns true when the
++// cluster wide room state should be deleted, i.e. this node was the last node
++// hosting the room (or distributed rooms are disabled).
++func (m *Manager) DetachRoom(_ context.Context, room *rtc.Room, reason types.RoomCloseReason) bool {
++	if m == nil {
++		return true
++	}
++	// the context of the request that created the room is long gone when the room closes
++	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
++	defer cancel()
++
++	m.lock.Lock()
++	rs := m.rooms[room.Name()]
++	if rs != nil && rs.room == room {
++		delete(m.rooms, room.Name())
++	} else {
++		rs = nil
++	}
++	m.lock.Unlock()
++
++	if rs != nil {
++		rs.onLocalRoomClosed(reason)
++		rs.close()
++	}
++
++	_, lastNode, err := m.store.RemoveRoomNode(ctx, room.Name(), m.currentNode.NodeID())
++	if err != nil {
++		room.Logger().Errorw("could not unregister room node", err)
++		return false
++	}
++	if !lastNode {
++		// nodes that died without unregistering would keep the room alive forever
++		remaining, prunedLast, err := m.pruneRoomNodes(ctx, room.Name())
++		if err != nil {
++			room.Logger().Errorw("could not get room nodes", err)
++			return false
++		}
++		if !prunedLast {
++			room.Logger().Infow("room closed on this node, still hosted by other nodes", "remainingNodes", remaining)
++			return false
++		}
++	}
++	if err := m.store.DeleteRoom(ctx, room.Name()); err != nil {
++		room.Logger().Errorw("could not delete distributed room state", err)
++	}
++	return true
++}
++
++// pruneRoomNodes removes nodes that are no longer available (crashed, or
++// restarted with a new node ID) from the room. It returns the remaining
++// available nodes and whether this call removed the last node of the room.
++func (m *Manager) pruneRoomNodes(ctx context.Context, roomName livekit.RoomName) ([]livekit.NodeID, bool, error) {
++	roomNodes, err := m.store.GetRoomNodes(ctx, roomName)
++	if err != nil || len(roomNodes) == 0 {
++		return nil, false, err
++	}
++	nodes, err := m.router.ListNodes()
++	if err != nil {
++		return nil, false, err
++	}
++	available := make(map[livekit.NodeID]bool, len(nodes))
++	for _, n := range nodes {
++		available[livekit.NodeID(n.Id)] = selector.IsAvailable(n)
++	}
++	var live []livekit.NodeID
++	removedLast := false
++	for _, nodeID := range roomNodes {
++		if available[nodeID] {
++			live = append(live, nodeID)
++			continue
++		}
++		m.logger.Infow("removing unavailable node from room", "room", roomName, "remoteNodeID", nodeID)
++		last, err := m.store.RemoveNode(ctx, roomName, nodeID)
++		if err != nil {
++			return nil, false, err
++		}
++		removedLast = removedLast || last
++	}
++	return live, removedLast, nil
++}
++
++// OnParticipantChanged is called for every participant change of a local room.
++func (m *Manager) OnParticipantChanged(room *rtc.Room, p types.Participant) {
++	if m == nil {
++		return
++	}
++	if rs := m.getRoomState(room); rs != nil {
++		rs.onParticipantChanged(p)
++	}
++}
++
++func (m *Manager) getRoomState(room *rtc.Room) *roomState {
++	m.lock.Lock()
++	defer m.lock.Unlock()
++	rs := m.rooms[room.Name()]
++	if rs == nil || rs.room != room {
++		return nil
++	}
++	return rs
++}
++
++// OnRoomUpdated is called when the room proto of a local room changed.
++func (m *Manager) OnRoomUpdated(room *rtc.Room) {
++	if m == nil {
++		return
++	}
++	if rs := m.getRoomState(room); rs != nil {
++		rs.onRoomUpdated()
++	}
++}
+diff --git a/pkg/distributed/messages.go b/pkg/distributed/messages.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8d41eca6b565e1eb596240119573ea517925387
+--- /dev/null
++++ b/pkg/distributed/messages.go
+@@ -0,0 +1,124 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"context"
++	"encoding/json"
++
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/psrpc"
++	"github.com/livekit/psrpc/pkg/bus"
++)
++
++// Node-to-node messages are JSON envelopes inside a wrapperspb.BytesValue, so
++// that no changes to github.com/livekit/protocol are needed. LiveKit protos
++// inside the envelope are carried in their binary encoding.
++
++type messageType string
++
++const (
++	// room channel
++	msgParticipantUpdate messageType = "participant_update"
++	msgSyncRequest       messageType = "sync_request"
++	msgDataPacket        messageType = "data_packet"
++	msgSpeakers          messageType = "speakers"
++	msgRoomMetadata      messageType = "room_metadata"
++	msgRoomClose         messageType = "room_close"
++	msgNodeLeft          messageType = "node_left"
++
++	// node channel (relay control, see relay*.go)
++	msgRelaySubscribe   messageType = "relay_subscribe"
++	msgRelayUnsubscribe messageType = "relay_unsubscribe"
++	msgRelayOffer       messageType = "relay_offer"
++	msgRelayAnswer      messageType = "relay_answer"
++	msgRelayCandidate   messageType = "relay_candidate"
++	msgRelayQuality     messageType = "relay_quality"
++)
++
++type message struct {
++	Type messageType      `json:"t"`
++	Node livekit.NodeID   `json:"n"`
++	Room livekit.RoomName `json:"r"`
++
++	// msgParticipantUpdate
++	Participant            []byte `json:"p,omitempty"`  // livekit.ParticipantInfo
++	SubscriptionPermission []byte `json:"sp,omitempty"` // livekit.SubscriptionPermission
++
++	// msgDataPacket
++	DataKind   livekit.DataPacket_Kind `json:"dk,omitempty"`
++	DataPacket []byte                  `json:"dp,omitempty"` // livekit.DataPacket
++
++	// msgSpeakers
++	Speakers []speaker `json:"s,omitempty"`
++
++	// msgRoomMetadata
++	Metadata string `json:"m,omitempty"`
++
++	// relay messages
++	TrackID   livekit.TrackID `json:"tr,omitempty"`
++	SDP       string          `json:"sdp,omitempty"`
++	Candidate string          `json:"c,omitempty"`
++	Qualities []byte          `json:"q,omitempty"` // livekit.SubscribedQualityUpdate
++	SessionID string          `json:"sid,omitempty"`
++	ToSender  bool            `json:"ts,omitempty"` // relay candidate for the sending side
++}
++
++type speaker struct {
++	ParticipantID livekit.ParticipantID `json:"p"`
++	Level         float32               `json:"l"`
++	Active        bool                  `json:"a"`
++}
++
++func roomChannel(roomName livekit.RoomName) bus.Channel {
++	name := "dist|room|" + string(roomName)
++	return bus.Channel{Legacy: name, Server: name}
++}
++
++func nodeChannel(nodeID livekit.NodeID) bus.Channel {
++	name := "dist|node|" + string(nodeID)
++	return bus.Channel{Legacy: name, Server: name}
++}
++
++func publish(ctx context.Context, b psrpc.MessageBus, ch bus.Channel, msg *message) error {
++	data, err := json.Marshal(msg)
++	if err != nil {
++		return err
++	}
++	return b.Publish(ctx, ch, wrapperspb.Bytes(data))
++}
++
++func subscribe(ctx context.Context, b psrpc.MessageBus, ch bus.Channel) (bus.Subscription[*wrapperspb.BytesValue], error) {
++	return bus.Subscribe[*wrapperspb.BytesValue](ctx, b, ch, 1000)
++}
++
++func decode(v *wrapperspb.BytesValue) (*message, error) {
++	msg := &message{}
++	if err := json.Unmarshal(v.GetValue(), msg); err != nil {
++		return nil, err
++	}
++	return msg, nil
++}
++
++func marshalProto(m proto.Message) []byte {
++	if m == nil {
++		return nil
++	}
++	b, _ := proto.Marshal(m)
++	return b
++}
+diff --git a/pkg/distributed/nodecheck.go b/pkg/distributed/nodecheck.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9e2ce62f42665bc1ad3df5a5a96a32b4977f801
+--- /dev/null
++++ b/pkg/distributed/nodecheck.go
+@@ -0,0 +1,86 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"time"
++
++	"github.com/livekit/protocol/livekit"
++
++	"github.com/livekit/livekit-server/pkg/routing/selector"
++)
++
++// nodeCheckWorker detects nodes of the room that died without announcing it
++// (crash, network partition). Their participants are removed from the local
++// room; the affected clients reconnect and are placed on a live node, because
++// the placement ignores participant assignments to dead nodes.
++func (rs *roomState) nodeCheckWorker() {
++	ticker := time.NewTicker(rs.m.conf.NodeCheckInterval)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-rs.ctx.Done():
++			return
++		case <-ticker.C:
++		}
++
++		nodes, err := rs.m.router.ListNodes()
++		if err != nil {
++			rs.logger.Warnw("could not list nodes", err)
++			continue
++		}
++		alive := make(map[livekit.NodeID]bool, len(nodes))
++		for _, n := range nodes {
++			alive[livekit.NodeID(n.Id)] = selector.IsAvailable(n)
++		}
++
++		for _, nodeID := range rs.remoteNodeIDs() {
++			if alive[nodeID] {
++				continue
++			}
++			rs.logger.Warnw("remote node of room is unavailable", nil, "remoteNodeID", nodeID)
++			removed := rs.removeNode(nodeID, "node unavailable")
++			if f := rs.m.onFailedNodeParticipant; f != nil {
++				for _, rp := range removed {
++					f(rs.ctx, rs.room.Name(), rp.lastActiveInfo())
++				}
++			}
++			if _, err := rs.m.store.RemoveNode(rs.ctx, rs.room.Name(), nodeID); err != nil && rs.ctx.Err() == nil {
++				rs.logger.Warnw("could not remove dead node from room", err, "remoteNodeID", nodeID)
++			}
++		}
++	}
++}
++
++func (rs *roomState) remoteNodeIDs() []livekit.NodeID {
++	rs.lock.Lock()
++	defer rs.lock.Unlock()
++	seen := make(map[livekit.NodeID]struct{})
++	var ids []livekit.NodeID
++	add := func(id livekit.NodeID) {
++		if _, ok := seen[id]; !ok {
++			seen[id] = struct{}{}
++			ids = append(ids, id)
++		}
++	}
++	for _, rp := range rs.remote {
++		add(rp.NodeID())
++	}
++	for id := range rs.conns {
++		add(id)
++	}
++	return ids
++}
+diff --git a/pkg/distributed/placement.go b/pkg/distributed/placement.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b0558b23fb7b1b9329e5e1af184195c585706d9
+--- /dev/null
++++ b/pkg/distributed/placement.go
+@@ -0,0 +1,259 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"context"
++	"errors"
++	"slices"
++
++	"github.com/redis/go-redis/v9"
++
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/logger"
++
++	"github.com/livekit/livekit-server/pkg/config"
++	"github.com/livekit/livekit-server/pkg/routing"
++	"github.com/livekit/livekit-server/pkg/routing/selector"
++)
++
++type NodeLister interface {
++	ListNodes() ([]*livekit.Node, error)
++}
++
++// Placer decides which node hosts a participant of a distributed room.
++//
++// Strategy "fill, then overflow": a participant is placed on a node that
++// already hosts the room, preferring the fullest node that is still below its
++// limits. Only when all nodes of the room are full, another node of the
++// cluster is added to the room.
++type Placer struct {
++	conf     config.DistributedConfig
++	limits   config.LimitConfig
++	store    *Store
++	rc       redis.UniversalClient
++	nodes    NodeLister
++	selector selector.NodeSelector
++	logger   logger.Logger
++}
++
++var _ routing.ParticipantPlacer = (*Placer)(nil)
++
++func NewPlacer(conf *config.Config, store *Store, rc redis.UniversalClient, nodes NodeLister) (*Placer, error) {
++	sel, err := selector.CreateNodeSelector(conf)
++	if err != nil {
++		return nil, err
++	}
++	return &Placer{
++		conf:     conf.Distributed,
++		limits:   conf.Limit,
++		store:    store,
++		rc:       rc,
++		nodes:    nodes,
++		selector: sel,
++		logger:   logger.GetLogger().WithComponent("distributed"),
++	}, nil
++}
++
++type placementState struct {
++	available  map[livekit.NodeID]*livekit.Node
++	roomNodes  []livekit.NodeID
++	counts     map[livekit.NodeID]int
++	assignment map[livekit.ParticipantIdentity]livekit.NodeID
++}
++
++func (p *Placer) loadState(ctx context.Context, roomName livekit.RoomName) (*placementState, error) {
++	nodes, err := p.nodes.ListNodes()
++	if err != nil {
++		return nil, err
++	}
++	st := &placementState{
++		available: make(map[livekit.NodeID]*livekit.Node),
++		counts:    make(map[livekit.NodeID]int),
++	}
++	for _, n := range selector.GetAvailableNodes(nodes) {
++		st.available[livekit.NodeID(n.Id)] = n
++	}
++
++	st.assignment, err = p.store.GetParticipantNodes(ctx, roomName)
++	if err != nil {
++		return nil, err
++	}
++	for _, nodeID := range st.assignment {
++		st.counts[nodeID]++
++	}
++
++	roomNodes, err := p.store.GetRoomNodes(ctx, roomName)
++	if err != nil {
++		return nil, err
++	}
++	// nodes with assigned participants, which have not created the room yet, are room nodes as well
++	for nodeID := range st.counts {
++		if !slices.Contains(roomNodes, nodeID) {
++			roomNodes = append(roomNodes, nodeID)
++		}
++	}
++	// node allocated by the standard room allocator (e.g. RoomService.CreateRoom)
++	if primary, err := p.rc.HGet(ctx, routing.NodeRoomKey, string(roomName)).Result(); err == nil {
++		if !slices.Contains(roomNodes, livekit.NodeID(primary)) {
++			roomNodes = append(roomNodes, livekit.NodeID(primary))
++		}
++	} else if !errors.Is(err, redis.Nil) {
++		return nil, err
++	}
++	slices.Sort(roomNodes)
++	st.roomNodes = roomNodes
++	return st, nil
++}
++
++// isFull reports whether node can not take another participant of the room.
++func (p *Placer) isFull(node *livekit.Node, roomParticipants int) bool {
++	if p.conf.MaxParticipantsPerNode > 0 && roomParticipants >= p.conf.MaxParticipantsPerNode {
++		return true
++	}
++	if selector.LimitsReached(p.limits, node.Stats) {
++		return true
++	}
++	if p.conf.CPULoadLimit > 0 && node.Stats != nil && node.Stats.CpuLoad > p.conf.CPULoadLimit {
++		return true
++	}
++	return false
++}
++
++// pick returns the node for the next participant of the room.
++func (p *Placer) pick(st *placementState) (*livekit.Node, string, error) {
++	// fill: fullest room node below its limits
++	var best *livekit.Node
++	bestCount := -1
++	for _, nodeID := range st.roomNodes {
++		node := st.available[nodeID]
++		if node == nil {
++			continue
++		}
++		count := st.counts[nodeID]
++		if p.isFull(node, count) {
++			continue
++		}
++		if count > bestCount {
++			best, bestCount = node, count
++		}
++	}
++	if best != nil {
++		return best, "fill", nil
++	}
++
++	// overflow: add another node to the room
++	var candidates []*livekit.Node
++	for nodeID, node := range st.available {
++		if slices.Contains(st.roomNodes, nodeID) {
++			continue
++		}
++		if p.isFull(node, 0) {
++			continue
++		}
++		candidates = append(candidates, node)
++	}
++	if len(candidates) == 0 {
++		return nil, "", routing.ErrNodeLimitReached
++	}
++	node, err := p.selector.SelectNode(candidates)
++	if err != nil {
++		return nil, "", err
++	}
++	if len(st.roomNodes) == 0 {
++		return node, "new", nil
++	}
++	return node, "overflow", nil
++}
++
++// NodeForParticipant selects (and records) the node for a participant.
++// A participant that is already assigned to a live node stays there, so
++// resumes and identity replacements are handled by the node holding the
++// participant's session.
++func (p *Placer) NodeForParticipant(ctx context.Context, roomName livekit.RoomName, pi routing.ParticipantInit) (livekit.NodeID, string, error) {
++	unlock, err := p.store.LockPlacement(ctx, roomName)
++	if err != nil {
++		return "", "", err
++	}
++	defer unlock()
++
++	st, err := p.loadState(ctx, roomName)
++	if err != nil {
++		return "", "", err
++	}
++
++	if nodeID := st.assignment[pi.Identity]; nodeID != "" && st.available[nodeID] != nil {
++		return nodeID, "assigned", nil
++	}
++
++	node, reason, err := p.pick(st)
++	if err != nil {
++		return "", "", err
++	}
++	nodeID := livekit.NodeID(node.Id)
++	if pi.Identity != "" {
++		if err := p.store.SetParticipantNode(ctx, roomName, pi.Identity, nodeID); err != nil {
++			return "", "", err
++		}
++	}
++	// keep upstream routing state pointing to a live node of the room
++	if primary := firstAvailable(st.roomNodes, st.available); primary == "" {
++		if err := p.rc.HSet(ctx, routing.NodeRoomKey, string(roomName), string(nodeID)).Err(); err != nil {
++			return "", "", err
++		}
++	}
++
++	p.logger.Infow(
++		"placed participant",
++		"room", roomName,
++		"participant", pi.Identity,
++		"nodeID", nodeID,
++		"reason", reason,
++		"roomNodes", st.roomNodes,
++		"roomParticipantsOnNode", st.counts[nodeID]+1,
++	)
++	return nodeID, reason, nil
++}
++
++// NodeForRoom returns the node that would host the next participant of the room.
++// It is used where upstream asks for "the" node of a room (room creation, WHIP,
++// limit checks).
++func (p *Placer) NodeForRoom(ctx context.Context, roomName livekit.RoomName) (*livekit.Node, error) {
++	st, err := p.loadState(ctx, roomName)
++	if err != nil {
++		return nil, err
++	}
++	if len(st.roomNodes) == 0 {
++		return nil, routing.ErrNotFound
++	}
++	node, _, err := p.pick(st)
++	if err != nil {
++		// everything is full, report a room node so that callers apply their limit handling
++		if nodeID := firstAvailable(st.roomNodes, st.available); nodeID != "" {
++			return st.available[nodeID], nil
++		}
++		return nil, routing.ErrNotFound
++	}
++	return node, nil
++}
++
++func firstAvailable(nodeIDs []livekit.NodeID, available map[livekit.NodeID]*livekit.Node) livekit.NodeID {
++	for _, nodeID := range nodeIDs {
++		if available[nodeID] != nil {
++			return nodeID
++		}
++	}
++	return ""
++}
+diff --git a/pkg/distributed/relayconn.go b/pkg/distributed/relayconn.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..bee6f777dfd56cae05608ab17bf76d8d58832d06
+--- /dev/null
++++ b/pkg/distributed/relayconn.go
+@@ -0,0 +1,397 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/pion/rtcp"
++	"github.com/pion/webrtc/v4"
++	"go.uber.org/atomic"
++
++	"github.com/livekit/protocol/codecs/mime"
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/logger"
++
++	"github.com/livekit/livekit-server/pkg/sfu"
++	"github.com/livekit/livekit-server/pkg/sfu/buffer"
++	"github.com/livekit/livekit-server/pkg/utils"
++)
++
++const (
++	relaySubscribeRetryInterval = 3 * time.Second
++
++	// a failed sending relay connection is recreated with exponential backoff
++	relayRetryBackoffMin = 3 * time.Second
++	relayRetryBackoffMax = time.Minute
++)
++
++// relayConn is the relay between this node and a peer node for one room.
++//
++// Each direction uses its own peer connection, offered by the sending node:
++//   - receiving: tracks published on the peer, subscribed by local participants
++//   - sending (relaySender): local tracks, subscribed by participants of the peer
++type relayConn struct {
++	rs     *roomState
++	peer   livekit.NodeID
++	logger logger.Logger
++
++	// buffers of tracks received from the peer
++	bufferFactory *buffer.Factory
++
++	lock              sync.Mutex
++	recvPC            *webrtc.PeerConnection
++	recvSession       string
++	pendingCandidates []webrtc.ICECandidateInit
++	requested         map[livekit.TrackID]*remoteTrack
++	sender            *relaySender
++	senderFailures    int
++	senderRetryAt     time.Time
++
++	closed atomic.Bool
++}
++
++func newRelayConn(rs *roomState, peer livekit.NodeID) *relayConn {
++	return &relayConn{
++		rs:            rs,
++		peer:          peer,
++		logger:        rs.logger.WithValues("remoteNodeID", peer),
++		bufferFactory: rs.room.GetBufferFactory(),
++		requested:     make(map[livekit.TrackID]*remoteTrack),
++	}
++}
++
++// pionLogger is the logger for the WebRTC stack of relay connections. It uses
++// the transport component, so that logging.pion_level applies like for
++// participant connections.
++func (c *relayConn) pionLogger() logger.Logger {
++	return logger.GetLogger().WithComponent(utils.ComponentTransport).WithValues(
++		"room", c.rs.room.Name(),
++		"remoteNodeID", c.peer,
++		"relay", true,
++	)
++}
++
++func (c *relayConn) close() {
++	if c.closed.Swap(true) {
++		return
++	}
++	c.lock.Lock()
++	pc := c.recvPC
++	c.recvPC = nil
++	sender := c.sender
++	c.sender = nil
++	c.lock.Unlock()
++
++	if pc != nil {
++		_ = pc.Close()
++	}
++	if sender != nil {
++		sender.close()
++	}
++}
++
++func (c *relayConn) sendToPeer(msg *message) {
++	msg.Node = c.rs.nodeID()
++	msg.Room = c.rs.room.Name()
++	ctx, cancel := context.WithTimeout(c.rs.ctx, publishTimeout)
++	defer cancel()
++	if err := publish(ctx, c.rs.m.bus, nodeChannel(c.peer), msg); err != nil && c.rs.ctx.Err() == nil {
++		c.logger.Warnw("could not send relay message", err, "type", msg.Type)
++	}
++}
++
++// --- receiving side ---
++
++// requestTrack asks the peer to relay a track. The request is repeated until
++// media arrives, which covers lost messages and peers still setting up.
++func (c *relayConn) requestTrack(t *remoteTrack) {
++	c.lock.Lock()
++	c.requested[t.ID()] = t
++	c.lock.Unlock()
++
++	c.logger.Debugw("requesting relayed track", "trackID", t.ID())
++	go func() {
++		for {
++			c.sendToPeer(&message{Type: msgRelaySubscribe, TrackID: t.ID()})
++			select {
++			case <-c.rs.ctx.Done():
++				return
++			case <-time.After(relaySubscribeRetryInterval):
++			}
++			if c.closed.Load() || !t.relayRequested.Load() || len(t.Receivers()) != 0 {
++				return
++			}
++		}
++	}()
++}
++
++func (c *relayConn) releaseTrack(t *remoteTrack) {
++	c.lock.Lock()
++	if c.requested[t.ID()] == t {
++		delete(c.requested, t.ID())
++	}
++	c.lock.Unlock()
++	if !c.closed.Load() {
++		c.sendToPeer(&message{Type: msgRelayUnsubscribe, TrackID: t.ID()})
++	}
++}
++
++func (c *relayConn) writeRTCP(pkts []rtcp.Packet) {
++	c.lock.Lock()
++	pc := c.recvPC
++	c.lock.Unlock()
++	if pc != nil {
++		_ = pc.WriteRTCP(pkts)
++	}
++}
++
++func (c *relayConn) sendSubscribedQualities(trackID livekit.TrackID, codecs []*livekit.SubscribedCodec) {
++	if c.closed.Load() {
++		return
++	}
++	c.sendToPeer(&message{
++		Type:      msgRelayQuality,
++		TrackID:   trackID,
++		Qualities: marshalProto(&livekit.SubscribedQualityUpdate{TrackSid: string(trackID), SubscribedCodecs: codecs}),
++	})
++}
++
++func (c *relayConn) handleOffer(session string, sdp string) {
++	c.lock.Lock()
++	pc := c.recvPC
++	if pc != nil && c.recvSession != session {
++		// the peer restarted its sending side
++		c.logger.Infow("relay session changed, recreating receiving connection")
++		_ = pc.Close()
++		pc = nil
++	}
++	if pc == nil {
++		var err error
++		pc, err = c.rs.m.relay.newPeerConnection(c.rs.room.ToProto().EnabledCodecs, c.bufferFactory, true, c.pionLogger())
++		if err != nil {
++			c.lock.Unlock()
++			c.logger.Errorw("could not create receiving relay connection", err)
++			return
++		}
++		c.recvPC = pc
++		c.recvSession = session
++		c.pendingCandidates = nil
++		pc.OnTrack(c.onTrack)
++		pc.OnICECandidate(func(cand *webrtc.ICECandidate) {
++			if cand == nil {
++				return
++			}
++			data, _ := json.Marshal(cand.ToJSON())
++			c.sendToPeer(&message{Type: msgRelayCandidate, Candidate: string(data), ToSender: true, SessionID: session})
++		})
++		pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
++			c.logger.Debugw("receiving relay connection state changed", "state", state)
++			if state == webrtc.PeerConnectionStateFailed {
++				c.logConnectionFailed("receiving")
++			}
++		})
++	}
++	c.lock.Unlock()
++
++	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdp}); err != nil {
++		c.logger.Errorw("could not set relay offer", err)
++		return
++	}
++
++	c.lock.Lock()
++	pending := c.pendingCandidates
++	c.pendingCandidates = nil
++	c.lock.Unlock()
++	for _, cand := range pending {
++		_ = pc.AddICECandidate(cand)
++	}
++
++	answer, err := pc.CreateAnswer(nil)
++	if err != nil {
++		c.logger.Errorw("could not create relay answer", err)
++		return
++	}
++	if err := pc.SetLocalDescription(answer); err != nil {
++		c.logger.Errorw("could not set relay answer", err)
++		return
++	}
++	c.sendToPeer(&message{Type: msgRelayAnswer, SDP: answer.SDP, SessionID: session})
++}
++
++func (c *relayConn) addRecvCandidate(session string, candidate string) {
++	var cand webrtc.ICECandidateInit
++	if err := json.Unmarshal([]byte(candidate), &cand); err != nil {
++		return
++	}
++	c.lock.Lock()
++	pc := c.recvPC
++	if pc == nil || c.recvSession != session || pc.RemoteDescription() == nil {
++		c.pendingCandidates = append(c.pendingCandidates, cand)
++		c.lock.Unlock()
++		return
++	}
++	c.lock.Unlock()
++	_ = pc.AddICECandidate(cand)
++}
++
++// relayed streams are identified by "<trackID>|<mime>|<stream index>"
++func relayStreamID(trackID livekit.TrackID, mimeType mime.MimeType, idx int) string {
++	return fmt.Sprintf("%s|%s|%d", trackID, mimeType, idx)
++}
++
++func parseRelayStreamID(id string) (livekit.TrackID, mime.MimeType, int, bool) {
++	parts := strings.Split(id, "|")
++	if len(parts) != 3 {
++		return "", mime.MimeTypeUnknown, 0, false
++	}
++	idx, err := strconv.Atoi(parts[2])
++	if err != nil {
++		return "", mime.MimeTypeUnknown, 0, false
++	}
++	return livekit.TrackID(parts[0]), mime.NormalizeMimeType(parts[1]), idx, true
++}
++
++func (c *relayConn) onTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
++	trackID, mimeType, idx, ok := parseRelayStreamID(track.ID())
++	if !ok {
++		c.logger.Warnw("unexpected relayed track", nil, "id", track.ID())
++		return
++	}
++
++	c.lock.Lock()
++	t := c.requested[trackID]
++	c.lock.Unlock()
++	if t == nil {
++		c.logger.Infow("relayed track not requested anymore", "trackID", trackID)
++		return
++	}
++
++	// simulcast streams are mapped back to the RID of their layer
++	rid := ""
++	if idx > 0 || len(buffer.GetVideoLayersForMimeType(mimeType, t.ToProto())) > 1 {
++		for _, l := range buffer.GetVideoLayersForMimeType(mimeType, t.ToProto()) {
++			if int(l.SpatialLayer) == idx {
++				rid = l.Rid
++				break
++			}
++		}
++	}
++
++	mid := ""
++	for _, tr := range c.recvPCTransceivers() {
++		if tr.Receiver() == receiver {
++			mid = tr.Mid()
++			break
++		}
++	}
++
++	c.logger.Debugw("relayed track received", "trackID", trackID, "mime", mimeType, "stream", idx, "rid", rid, "ssrc", track.SSRC())
++	if _, ok := t.MediaTrack.AddReceiver(receiver, &relayTrackRemote{TrackRemote: track, rid: rid}, mid); !ok {
++		c.logger.Warnw("could not add relayed receiver", nil, "trackID", trackID, "mime", mimeType, "stream", idx)
++	}
++}
++
++func (c *relayConn) recvPCTransceivers() []*webrtc.RTPTransceiver {
++	c.lock.Lock()
++	pc := c.recvPC
++	c.lock.Unlock()
++	if pc == nil {
++		return nil
++	}
++	return pc.GetTransceivers()
++}
++
++// --- sending side ---
++
++func (c *relayConn) getOrCreateSender() *relaySender {
++	c.lock.Lock()
++	defer c.lock.Unlock()
++	if c.closed.Load() {
++		return nil
++	}
++	if c.sender != nil && c.sender.isFailed() {
++		c.sender.close()
++		c.sender = nil
++		c.senderFailures++
++		backoff := relayRetryBackoffMin << min(c.senderFailures-1, 5)
++		if backoff > relayRetryBackoffMax {
++			backoff = relayRetryBackoffMax
++		}
++		c.senderRetryAt = time.Now().Add(backoff)
++		c.logger.Infow("retrying sending relay connection later", "failures", c.senderFailures, "backoff", backoff)
++	}
++	if c.sender == nil && time.Now().Before(c.senderRetryAt) {
++		// the peer repeats its subscription requests until the relay works
++		return nil
++	}
++	if c.sender == nil {
++		s, err := newRelaySender(c)
++		if err != nil {
++			c.logger.Errorw("could not create sending relay connection", err)
++			return nil
++		}
++		c.sender = s
++	}
++	return c.sender
++}
++
++func (c *relayConn) onSenderConnected() {
++	c.lock.Lock()
++	failures := c.senderFailures
++	c.senderFailures = 0
++	c.senderRetryAt = time.Time{}
++	c.lock.Unlock()
++	if failures > 0 {
++		c.logger.Infow("sending relay connection established after failures", "failures", failures)
++	}
++}
++
++// logConnectionFailed explains the most likely cause of a failed relay connection.
++func (c *relayConn) logConnectionFailed(direction string) {
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	remote, _ := c.rs.m.store.GetNodeRelayAddress(ctx, c.peer)
++	c.logger.Warnw(
++		"relay connection to remote node failed, nodes must reach each other on the relay UDP port range", nil,
++		"direction", direction,
++		"localRelayAddress", c.rs.m.relay.address(),
++		"remoteRelayAddress", remote,
++		"hint", "check firewall rules for distributed.relay.port_range_start..port_range_end and distributed.relay.node_ip / "+RelayNodeIPEnv,
++	)
++}
++
++func (c *relayConn) getSender() *relaySender {
++	c.lock.Lock()
++	defer c.lock.Unlock()
++	return c.sender
++}
++
++// relayTrackRemote presents a relayed stream with the RID of its simulcast layer.
++type relayTrackRemote struct {
++	*webrtc.TrackRemote
++	rid string
++}
++
++var _ sfu.TrackRemote = (*relayTrackRemote)(nil)
++
++func (t *relayTrackRemote) RID() string                   { return t.rid }
++func (t *relayTrackRemote) RTCTrack() *webrtc.TrackRemote { return t.TrackRemote }
+diff --git a/pkg/distributed/relaysender.go b/pkg/distributed/relaysender.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7dd00c50fb617225cd68609d3171ecac5efd492
+--- /dev/null
++++ b/pkg/distributed/relaysender.go
+@@ -0,0 +1,533 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"encoding/json"
++	"sync"
++	"time"
++
++	"github.com/pion/rtcp"
++	"github.com/pion/rtp"
++	"github.com/pion/webrtc/v4"
++	"go.uber.org/atomic"
++	"google.golang.org/protobuf/proto"
++
++	"github.com/livekit/protocol/codecs/mime"
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/logger"
++	"github.com/livekit/protocol/utils/guid"
++
++	"github.com/livekit/livekit-server/pkg/rtc/types"
++	"github.com/livekit/livekit-server/pkg/sfu"
++	"github.com/livekit/livekit-server/pkg/sfu/buffer"
++	sfuutils "github.com/livekit/livekit-server/pkg/sfu/utils"
++)
++
++const relayNegotiationTimeout = 10 * time.Second
++
++// relaySender relays local tracks to one peer node. Every relayed stream
++// (codec x simulcast layer) is a separate sendonly transceiver, so the
++// receiving node gets all layers and does layer selection for its own
++// subscribers.
++type relaySender struct {
++	conn    *relayConn
++	pc      *webrtc.PeerConnection
++	session string
++	logger  logger.Logger
++
++	lock              sync.Mutex
++	tracks            map[livekit.TrackID]*relayedTrack
++	negotiating       bool
++	negotiationNeeded bool
++	negotiationTimer  *time.Timer
++	pendingCandidates []webrtc.ICECandidateInit
++
++	failed atomic.Bool
++	closed atomic.Bool
++}
++
++type relayedTrack struct {
++	track      types.MediaTrack
++	downTracks []*relayDownTrack
++}
++
++func newRelaySender(c *relayConn) (*relaySender, error) {
++	pc, err := c.rs.m.relay.newPeerConnection(c.rs.room.ToProto().EnabledCodecs, nil, false, c.pionLogger())
++	if err != nil {
++		return nil, err
++	}
++	s := &relaySender{
++		conn:    c,
++		pc:      pc,
++		session: guid.New("RS_"),
++		logger:  c.logger.WithValues("relaySession", ""),
++		tracks:  make(map[livekit.TrackID]*relayedTrack),
++	}
++	s.logger = c.logger.WithValues("relaySession", s.session)
++
++	pc.OnICECandidate(func(cand *webrtc.ICECandidate) {
++		if cand == nil {
++			return
++		}
++		data, _ := json.Marshal(cand.ToJSON())
++		c.sendToPeer(&message{Type: msgRelayCandidate, Candidate: string(data), SessionID: s.session})
++	})
++	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
++		s.logger.Debugw("sending relay connection state changed", "state", state)
++		switch state {
++		case webrtc.PeerConnectionStateConnected:
++			c.onSenderConnected()
++		case webrtc.PeerConnectionStateFailed:
++			s.failed.Store(true)
++			c.logConnectionFailed("sending")
++		}
++	})
++	return s, nil
++}
++
++func (s *relaySender) isFailed() bool {
++	return s.failed.Load() || s.closed.Load()
++}
++
++func (s *relaySender) close() {
++	if s.closed.Swap(true) {
++		return
++	}
++	s.lock.Lock()
++	tracks := s.tracks
++	s.tracks = make(map[livekit.TrackID]*relayedTrack)
++	if s.negotiationTimer != nil {
++		s.negotiationTimer.Stop()
++	}
++	s.lock.Unlock()
++
++	for _, rt := range tracks {
++		s.detach(rt)
++	}
++	_ = s.pc.Close()
++}
++
++func (s *relaySender) findLocalTrack(trackID livekit.TrackID) types.MediaTrack {
++	for _, p := range s.conn.rs.room.GetParticipants() {
++		if t := p.GetPublishedTrack(trackID); t != nil {
++			return t
++		}
++	}
++	return nil
++}
++
++// addTrack starts relaying a local track to the peer.
++func (s *relaySender) addTrack(trackID livekit.TrackID) {
++	s.lock.Lock()
++	if s.tracks[trackID] != nil {
++		s.lock.Unlock()
++		return
++	}
++	s.lock.Unlock()
++
++	track := s.findLocalTrack(trackID)
++	if track == nil {
++		s.logger.Debugw("relay requested for unknown track", "trackID", trackID)
++		return
++	}
++	receivers := track.Receivers()
++	if len(receivers) == 0 {
++		// not receiving media yet, the peer repeats its request
++		s.logger.Debugw("relay requested for track without receivers", "trackID", trackID)
++		return
++	}
++
++	rt := &relayedTrack{track: track}
++	for _, r := range receivers {
++		dt, err := s.addReceiver(trackID, track, r)
++		if err != nil {
++			s.logger.Warnw("could not relay receiver", err, "trackID", trackID, "mime", r.Mime())
++			continue
++		}
++		rt.downTracks = append(rt.downTracks, dt)
++	}
++	if len(rt.downTracks) == 0 {
++		return
++	}
++
++	s.lock.Lock()
++	if s.closed.Load() || s.tracks[trackID] != nil {
++		s.lock.Unlock()
++		s.detach(rt)
++		return
++	}
++	s.tracks[trackID] = rt
++	s.lock.Unlock()
++
++	track.AddOnClose(func(bool) {
++		s.removeTrack(trackID)
++	})
++
++	// make sure the publisher keeps sending, even without local subscribers,
++	// until the peer reports its own subscribed qualities
++	if lt, ok := track.(types.LocalMediaTrack); ok {
++		var qualities []types.SubscribedCodecQuality
++		for _, r := range receivers {
++			qualities = append(qualities, types.SubscribedCodecQuality{CodecMime: r.Mime(), Quality: livekit.VideoQuality_HIGH})
++		}
++		lt.NotifySubscriberNodeMaxQuality(s.conn.peer, qualities)
++	}
++
++	s.logger.Infow("relaying track to remote node", "trackID", trackID, "numCodecs", len(rt.downTracks))
++	s.negotiate()
++}
++
++func (s *relaySender) addReceiver(trackID livekit.TrackID, track types.MediaTrack, r sfu.TrackReceiver) (*relayDownTrack, error) {
++	mimeType := r.Mime()
++	numStreams := 1
++	if mime.IsMimeTypeVideo(mimeType) && sfuutils.IsSimulcastMode(r.VideoLayerMode()) {
++		if n := len(buffer.GetVideoLayersForMimeType(mimeType, track.ToProto())); n > 1 {
++			numStreams = n
++		}
++	}
++
++	dt := &relayDownTrack{
++		sender:       s,
++		receiver:     r,
++		trackID:      trackID,
++		subscriberID: livekit.ParticipantID("RELAY_" + string(s.conn.peer) + "_" + s.session),
++		simulcast:    numStreams > 1,
++	}
++	for i := 0; i < numStreams; i++ {
++		local, err := webrtc.NewTrackLocalStaticRTP(r.Codec().RTPCodecCapability, relayStreamID(trackID, mimeType, i), string(trackID))
++		if err != nil {
++			return nil, err
++		}
++		tr, err := s.pc.AddTransceiverFromTrack(local, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly})
++		if err != nil {
++			return nil, err
++		}
++		st := &relayStream{
++			downTrack: dt,
++			layer:     int32(i),
++			local:     local,
++			sender:    tr.Sender(),
++		}
++		dt.streams = append(dt.streams, st)
++		go st.readRTCP()
++	}
++
++	if err := r.AddDownTrack(dt); err != nil {
++		for _, st := range dt.streams {
++			_ = s.pc.RemoveTrack(st.sender)
++		}
++		return nil, err
++	}
++	return dt, nil
++}
++
++func (s *relaySender) removeTrack(trackID livekit.TrackID) {
++	s.lock.Lock()
++	rt := s.tracks[trackID]
++	delete(s.tracks, trackID)
++	s.lock.Unlock()
++	if rt == nil {
++		return
++	}
++
++	s.logger.Infow("stopped relaying track to remote node", "trackID", trackID)
++	s.detach(rt)
++	if lt, ok := rt.track.(types.LocalMediaTrack); ok {
++		lt.NotifySubscriberNodeMaxQuality(s.conn.peer, nil)
++	}
++	if !s.closed.Load() {
++		s.negotiate()
++	}
++}
++
++func (s *relaySender) detach(rt *relayedTrack) {
++	for _, dt := range rt.downTracks {
++		dt.Close()
++		dt.receiver.DeleteDownTrack(dt.subscriberID)
++		if !s.closed.Load() {
++			for _, st := range dt.streams {
++				_ = s.pc.RemoveTrack(st.sender)
++			}
++		}
++	}
++}
++
++// handleQualities forwards the qualities subscribed on the peer to the
++// publisher's dynacast, so that unused simulcast layers are paused.
++func (s *relaySender) handleQualities(trackID livekit.TrackID, data []byte) {
++	s.lock.Lock()
++	rt := s.tracks[trackID]
++	s.lock.Unlock()
++	if rt == nil {
++		return
++	}
++	lt, ok := rt.track.(types.LocalMediaTrack)
++	if !ok {
++		return
++	}
++	update := &livekit.SubscribedQualityUpdate{}
++	if err := proto.Unmarshal(data, update); err != nil {
++		return
++	}
++	qualities := make([]types.SubscribedCodecQuality, 0, len(update.SubscribedCodecs))
++	for _, sc := range update.SubscribedCodecs {
++		maxQuality := livekit.VideoQuality_OFF
++		for _, q := range sc.Qualities {
++			if q.Enabled && (maxQuality == livekit.VideoQuality_OFF || q.Quality > maxQuality) {
++				maxQuality = q.Quality
++			}
++		}
++		qualities = append(qualities, types.SubscribedCodecQuality{CodecMime: mime.NormalizeMimeType(sc.Codec), Quality: maxQuality})
++	}
++	lt.NotifySubscriberNodeMaxQuality(s.conn.peer, qualities)
++}
++
++// --- negotiation, the sending side is always the offerer ---
++
++func (s *relaySender) negotiate() {
++	s.lock.Lock()
++	if s.negotiating {
++		s.negotiationNeeded = true
++		s.lock.Unlock()
++		return
++	}
++	s.negotiating = true
++	s.negotiationNeeded = false
++	s.lock.Unlock()
++
++	offer, err := s.pc.CreateOffer(nil)
++	if err == nil {
++		err = s.pc.SetLocalDescription(offer)
++	}
++	if err != nil {
++		s.logger.Errorw("could not create relay offer", err)
++		s.lock.Lock()
++		s.negotiating = false
++		s.lock.Unlock()
++		return
++	}
++
++	s.lock.Lock()
++	if s.negotiationTimer != nil {
++		s.negotiationTimer.Stop()
++	}
++	// an answer might get lost, offer again after a timeout
++	s.negotiationTimer = time.AfterFunc(relayNegotiationTimeout, func() {
++		s.lock.Lock()
++		stuck := s.negotiating && !s.closed.Load()
++		s.lock.Unlock()
++		if stuck {
++			s.logger.Infow("relay negotiation timed out, retrying")
++			_ = s.pc.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback})
++			s.lock.Lock()
++			s.negotiating = false
++			s.lock.Unlock()
++			s.negotiate()
++		}
++	})
++	s.lock.Unlock()
++
++	s.conn.sendToPeer(&message{Type: msgRelayOffer, SDP: offer.SDP, SessionID: s.session})
++}
++
++func (s *relaySender) handleAnswer(session string, sdp string) {
++	if session != s.session {
++		return
++	}
++	if err := s.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp}); err != nil {
++		s.logger.Errorw("could not set relay answer", err)
++		return
++	}
++
++	s.lock.Lock()
++	if s.negotiationTimer != nil {
++		s.negotiationTimer.Stop()
++	}
++	s.negotiating = false
++	again := s.negotiationNeeded
++	pending := s.pendingCandidates
++	s.pendingCandidates = nil
++	var downTracks []*relayDownTrack
++	for _, rt := range s.tracks {
++		downTracks = append(downTracks, rt.downTracks...)
++	}
++	s.lock.Unlock()
++
++	for _, cand := range pending {
++		_ = s.pc.AddICECandidate(cand)
++	}
++	for _, dt := range downTracks {
++		dt.updateExtensionMaps()
++	}
++	if again {
++		s.negotiate()
++	}
++}
++
++func (s *relaySender) addCandidate(session string, candidate string) {
++	if session != s.session {
++		return
++	}
++	var cand webrtc.ICECandidateInit
++	if err := json.Unmarshal([]byte(candidate), &cand); err != nil {
++		return
++	}
++	s.lock.Lock()
++	if s.pc.RemoteDescription() == nil {
++		s.pendingCandidates = append(s.pendingCandidates, cand)
++		s.lock.Unlock()
++		return
++	}
++	s.lock.Unlock()
++	_ = s.pc.AddICECandidate(cand)
++}
++
++// --- relayDownTrack, the sfu.TrackSender attached to a local receiver ---
++
++type relayDownTrack struct {
++	sender       *relaySender
++	receiver     sfu.TrackReceiver
++	trackID      livekit.TrackID
++	subscriberID livekit.ParticipantID
++	simulcast    bool
++	streams      []*relayStream
++	closed       atomic.Bool
++}
++
++var _ sfu.TrackSender = (*relayDownTrack)(nil)
++
++type relayStream struct {
++	downTrack *relayDownTrack
++	layer     int32
++	local     *webrtc.TrackLocalStaticRTP
++	sender    *webrtc.RTPSender
++	// source header extension id => negotiated relay header extension id
++	extMap atomic.Pointer[map[uint8]uint8]
++	ssrc   atomic.Uint32
++}
++
++func (d *relayDownTrack) updateExtensionMaps() {
++	source := d.receiver.HeaderExtensions()
++	for _, st := range d.streams {
++		params := st.sender.GetParameters()
++		m := make(map[uint8]uint8)
++		for _, src := range source {
++			for _, neg := range params.HeaderExtensions {
++				if src.URI == neg.URI {
++					m[uint8(src.ID)] = uint8(neg.ID)
++				}
++			}
++		}
++		st.extMap.Store(&m)
++		if len(params.Encodings) != 0 {
++			st.ssrc.Store(uint32(params.Encodings[0].SSRC))
++		}
++	}
++}
++
++func (d *relayDownTrack) streamForLayer(layer int32) *relayStream {
++	idx := int32(0)
++	if d.simulcast {
++		idx = layer
++	}
++	if idx < 0 || int(idx) >= len(d.streams) {
++		return nil
++	}
++	return d.streams[idx]
++}
++
++func (d *relayDownTrack) WriteRTP(p *buffer.ExtPacket, layer int32) int32 {
++	if d.closed.Load() || p == nil || p.Packet == nil || len(p.Packet.Payload) == 0 {
++		return 0
++	}
++	st := d.streamForLayer(layer)
++	if st == nil {
++		return 0
++	}
++	extMap := st.extMap.Load()
++	if extMap == nil {
++		// not negotiated yet
++		return 0
++	}
++
++	// header extension ids differ between the publisher's and the relay connection
++	src := &p.Packet.Header
++	hdr := *src
++	hdr.Padding = false
++	hdr.PaddingSize = 0
++	hdr.Extension = false
++	hdr.ExtensionProfile = 0
++	hdr.Extensions = nil
++	for _, id := range src.GetExtensionIDs() {
++		if relayID, ok := (*extMap)[id]; ok {
++			_ = hdr.SetExtension(relayID, src.GetExtension(id))
++		}
++	}
++
++	if err := st.local.WriteRTP(&rtp.Packet{Header: hdr, Payload: p.Packet.Payload}); err != nil {
++		return 0
++	}
++	return int32(len(p.Packet.Payload))
++}
++
++// HandleRTCPSenderReportData forwards the publisher's sender reports, which
++// keeps audio/video synchronization intact across the relay.
++func (d *relayDownTrack) HandleRTCPSenderReportData(_ webrtc.PayloadType, layer int32, sr *livekit.RTCPSenderReportState) error {
++	st := d.streamForLayer(layer)
++	if st == nil || sr == nil {
++		return nil
++	}
++	ssrc := st.ssrc.Load()
++	if ssrc == 0 {
++		return nil
++	}
++	return d.sender.pc.WriteRTCP([]rtcp.Packet{&rtcp.SenderReport{
++		SSRC:        ssrc,
++		NTPTime:     sr.NtpTimestamp,
++		RTPTime:     sr.RtpTimestamp,
++		PacketCount: sr.Packets,
++		OctetCount:  uint32(sr.Octets),
++	}})
++}
++
++func (d *relayDownTrack) UpTrackLayersChange()                       {}
++func (d *relayDownTrack) UpTrackBitrateAvailabilityChange()          {}
++func (d *relayDownTrack) UpTrackMaxPublishedLayerChange(int32)       {}
++func (d *relayDownTrack) UpTrackMaxTemporalLayerSeenChange(int32)    {}
++func (d *relayDownTrack) UpTrackBitrateReport([]int32, sfu.Bitrates) {}
++func (d *relayDownTrack) Close()                                     { d.closed.Store(true) }
++func (d *relayDownTrack) IsClosed() bool                             { return d.closed.Load() }
++func (d *relayDownTrack) ID() string                                 { return string(d.trackID) }
++func (d *relayDownTrack) SubscriberID() livekit.ParticipantID        { return d.subscriberID }
++func (d *relayDownTrack) Resync()                                    {}
++func (d *relayDownTrack) SetReceiver(sfu.TrackReceiver)              {}
++func (d *relayDownTrack) ReceiverRestart(sfu.TrackReceiver)          {}
++
++// readRTCP forwards key frame requests of the peer to the publisher.
++func (st *relayStream) readRTCP() {
++	for {
++		pkts, _, err := st.sender.ReadRTCP()
++		if err != nil {
++			return
++		}
++		for _, pkt := range pkts {
++			switch pkt.(type) {
++			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
++				st.downTrack.receiver.SendPLI(st.layer, false)
++			}
++		}
++	}
++}
+diff --git a/pkg/distributed/relaytransport.go b/pkg/distributed/relaytransport.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec833742df242c777d635d8790f8ed70a72d3fe8
+--- /dev/null
++++ b/pkg/distributed/relaytransport.go
+@@ -0,0 +1,179 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"fmt"
++	"net"
++	"strconv"
++
++	"github.com/pion/ice/v4"
++	"github.com/pion/interceptor"
++	"github.com/pion/interceptor/pkg/nack"
++	"github.com/pion/webrtc/v4"
++
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/logger"
++	"github.com/livekit/protocol/logger/pionlogger"
++
++	"github.com/livekit/livekit-server/pkg/config"
++	"github.com/livekit/livekit-server/pkg/rtc"
++	"github.com/livekit/livekit-server/pkg/sfu/buffer"
++)
++
++const (
++	defaultRelayPortRangeStart = 7890
++	defaultRelayPortRangeSize  = 1000
++)
++
++// RelayNodeIPEnv sets the relay IP of a node when distributed.relay.node_ip is
++// not configured. In Kubernetes it is typically filled with the pod IP via the
++// downward API, so that all pods can share one configuration.
++const RelayNodeIPEnv = "LIVEKIT_RELAY_NODE_IP"
++
++// relayNodeIP selects the IP other nodes use to reach this node's relay port:
++// configuration, then environment, then the node IP.
++func relayNodeIP(configured, env, nodeIP string) (ip string, source string, err error) {
++	switch {
++	case configured != "":
++		ip, source = configured, "config"
++	case env != "":
++		ip, source = env, RelayNodeIPEnv
++	default:
++		ip, source = nodeIP, "node_ip"
++	}
++	if parsed := net.ParseIP(ip); parsed == nil || parsed.To4() == nil {
++		return "", source, fmt.Errorf("invalid relay node ip %q (from %s), an IPv4 address is required", ip, source)
++	}
++	return ip, source, nil
++}
++
++// relayTransport holds the node wide settings of relay peer connections.
++//
++// Every relay peer connection binds its own UDP port from the port range. A
++// shared, multiplexed port does not work: the connections of both directions
++// (and of several rooms) between the same two nodes would use the same
++// address pair and could not be told apart.
++type relayTransport struct {
++	portMin uint16
++	portMax uint16
++	ip      string
++	// local interface IP equal to ip, restricts candidates to that interface
++	localIP net.IP
++	rtcConf *rtc.WebRTCConfig
++	logger  logger.Logger
++}
++
++func relayPortRange(conf config.DistributedRelayConfig) (uint16, uint16, error) {
++	start, end := conf.PortRangeStart, conf.PortRangeEnd
++	if start == 0 && conf.UDPPort != 0 {
++		start = uint16(conf.UDPPort)
++	}
++	if start == 0 {
++		start = defaultRelayPortRangeStart
++	}
++	if end == 0 {
++		end = start + defaultRelayPortRangeSize - 1
++	}
++	if end < start {
++		return 0, 0, fmt.Errorf("invalid relay port range %d-%d", start, end)
++	}
++	return start, end, nil
++}
++
++func newRelayTransport(conf config.DistributedRelayConfig, ip string, rtcConf *rtc.WebRTCConfig, l logger.Logger) (*relayTransport, error) {
++	portMin, portMax, err := relayPortRange(conf)
++	if err != nil {
++		return nil, err
++	}
++	if conf.UDPPort != 0 {
++		l.Warnw("distributed.relay.udp_port is deprecated, use port_range_start/port_range_end", nil, "udpPort", conf.UDPPort)
++	}
++	t := &relayTransport{
++		portMin: portMin,
++		portMax: portMax,
++		ip:      ip,
++		rtcConf: rtcConf,
++		logger:  l,
++	}
++	if addrs, err := net.InterfaceAddrs(); err == nil {
++		relayIP := net.ParseIP(ip)
++		for _, a := range addrs {
++			if n, ok := a.(*net.IPNet); ok && n.IP.Equal(relayIP) {
++				t.localIP = relayIP
++			}
++		}
++	}
++	l.Infow("relay transport", "portRange", fmt.Sprintf("%d-%d", portMin, portMax), "ip", ip, "localInterface", t.localIP != nil)
++	return t, nil
++}
++
++// address identifies the relay endpoint of the node (ip and first port).
++func (t *relayTransport) address() string {
++	return net.JoinHostPort(t.ip, strconv.Itoa(int(t.portMin)))
++}
++
++func (t *relayTransport) close() {}
++
++// newPeerConnection creates a relay peer connection. A receiving connection
++// writes into LiveKit buffers of bufferFactory (like publisher connections do),
++// a sending connection answers NACKs of the receiving node.
++func (t *relayTransport) newPeerConnection(codecs []*livekit.Codec, bufferFactory *buffer.Factory, receiving bool, l logger.Logger) (*webrtc.PeerConnection, error) {
++	me, err := rtc.NewRelayMediaEngine(codecs, t.rtcConf)
++	if err != nil {
++		return nil, err
++	}
++
++	se := webrtc.SettingEngine{}
++	if err := se.SetEphemeralUDPPortRange(t.portMin, t.portMax); err != nil {
++		return nil, err
++	}
++	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
++	if t.localIP != nil {
++		// the relay IP is a local address (e.g. the pod IP), gather only on it
++		localIP := t.localIP
++		se.SetIPFilter(func(ip net.IP) bool { return ip.Equal(localIP) })
++		if localIP.IsLoopback() {
++			se.SetIncludeLoopbackCandidate(true)
++		}
++	} else {
++		// the relay IP is mapped to this node (NAT), announce it instead of local addresses
++		se.SetNAT1To1IPs([]string{t.ip}, webrtc.ICECandidateTypeHost)
++	}
++	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
++	se.DisableSRTPReplayProtection(true)
++	se.DisableSRTCPReplayProtection(true)
++	se.SetLite(false)
++	se.LoggerFactory = pionlogger.NewLoggerFactory(l)
++	if receiving {
++		se.BufferFactory = bufferFactory.GetOrNew
++	}
++
++	ir := &interceptor.Registry{}
++	if !receiving {
++		responder, err := nack.NewResponderInterceptor()
++		if err != nil {
++			return nil, err
++		}
++		ir.Add(responder)
++	}
++
++	api := webrtc.NewAPI(
++		webrtc.WithMediaEngine(me),
++		webrtc.WithSettingEngine(se),
++		webrtc.WithInterceptorRegistry(ir),
++	)
++	return api.NewPeerConnection(webrtc.Configuration{})
++}
+diff --git a/pkg/distributed/remoteparticipant.go b/pkg/distributed/remoteparticipant.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..90b49bb27f7f1d67cf681d7f156d4cce2c31ff19
+--- /dev/null
++++ b/pkg/distributed/remoteparticipant.go
+@@ -0,0 +1,313 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"maps"
++	"slices"
++	"sync"
++	"time"
++
++	"google.golang.org/protobuf/proto"
++
++	"github.com/livekit/protocol/datatrack"
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/logger"
++	"github.com/livekit/protocol/utils"
++
++	"github.com/livekit/livekit-server/pkg/rtc"
++	"github.com/livekit/livekit-server/pkg/rtc/types"
++)
++
++const remoteSpeakerTimeout = 3 * time.Second
++
++// RemoteParticipant mirrors a participant hosted on another node of a
++// distributed room. Its state is driven by participant_update messages of the
++// hosting node, its tracks are relayed on demand.
++type RemoteParticipant struct {
++	nodeID livekit.NodeID
++	logger logger.Logger
++
++	lock        sync.RWMutex
++	info        *livekit.ParticipantInfo
++	permission  *livekit.SubscriptionPermission
++	tracks      map[livekit.TrackID]*remoteTrack
++	closed      bool
++	audioLevel  float64
++	audioActive bool
++	audioAt     time.Time
++}
++
++var _ rtc.RemoteNodeParticipant = (*RemoteParticipant)(nil)
++
++func newRemoteParticipant(nodeID livekit.NodeID, info *livekit.ParticipantInfo, l logger.Logger) *RemoteParticipant {
++	return &RemoteParticipant{
++		nodeID: nodeID,
++		info:   info,
++		tracks: make(map[livekit.TrackID]*remoteTrack),
++		logger: l.WithValues("participant", info.Identity, "pID", info.Sid, "remoteNodeID", nodeID),
++	}
++}
++
++func (p *RemoteParticipant) IsRemoteNodeParticipant() bool { return true }
++func (p *RemoteParticipant) NodeID() livekit.NodeID        { return p.nodeID }
++
++func (p *RemoteParticipant) getInfo() *livekit.ParticipantInfo {
++	p.lock.RLock()
++	defer p.lock.RUnlock()
++	return p.info
++}
++
++// update applies a new state, returns false for outdated updates.
++func (p *RemoteParticipant) update(info *livekit.ParticipantInfo, perm *livekit.SubscriptionPermission) bool {
++	p.lock.Lock()
++	defer p.lock.Unlock()
++	if info.Version < p.info.Version {
++		return false
++	}
++	p.info = info
++	p.permission = perm
++	return true
++}
++
++// lastActiveInfo returns the participant info as reported by its node.
++func (p *RemoteParticipant) lastActiveInfo() *livekit.ParticipantInfo {
++	return p.getInfo()
++}
++
++func (p *RemoteParticipant) markDisconnected() {
++	p.lock.Lock()
++	defer p.lock.Unlock()
++	p.closed = true
++	info := proto.CloneOf(p.info)
++	info.State = livekit.ParticipantInfo_DISCONNECTED
++	info.Version++
++	p.info = info
++}
++
++func (p *RemoteParticipant) setAudioLevel(level float64, active bool) {
++	p.lock.Lock()
++	defer p.lock.Unlock()
++	p.audioLevel, p.audioActive, p.audioAt = level, active, time.Now()
++}
++
++func (p *RemoteParticipant) getTrack(trackID livekit.TrackID) *remoteTrack {
++	p.lock.RLock()
++	defer p.lock.RUnlock()
++	return p.tracks[trackID]
++}
++
++func (p *RemoteParticipant) setTrack(t *remoteTrack) {
++	p.lock.Lock()
++	defer p.lock.Unlock()
++	p.tracks[t.ID()] = t
++}
++
++func (p *RemoteParticipant) deleteTrack(trackID livekit.TrackID) {
++	p.lock.Lock()
++	defer p.lock.Unlock()
++	delete(p.tracks, trackID)
++}
++
++func (p *RemoteParticipant) remoteTracks() []*remoteTrack {
++	p.lock.RLock()
++	defer p.lock.RUnlock()
++	return slices.Collect(maps.Values(p.tracks))
++}
++
++// --- types.Participant ---
++
++func (p *RemoteParticipant) ID() livekit.ParticipantID {
++	return livekit.ParticipantID(p.getInfo().Sid)
++}
++
++func (p *RemoteParticipant) Identity() livekit.ParticipantIdentity {
++	return livekit.ParticipantIdentity(p.getInfo().Identity)
++}
++
++func (p *RemoteParticipant) State() livekit.ParticipantInfo_State {
++	return p.getInfo().State
++}
++
++func (p *RemoteParticipant) ConnectedAt() time.Time {
++	info := p.getInfo()
++	if info.JoinedAtMs != 0 {
++		return time.UnixMilli(info.JoinedAtMs)
++	}
++	return time.Unix(info.JoinedAt, 0)
++}
++
++func (p *RemoteParticipant) CloseReason() types.ParticipantCloseReason {
++	return types.ParticipantCloseReasonNone
++}
++
++func (p *RemoteParticipant) Kind() livekit.ParticipantInfo_Kind {
++	return p.getInfo().Kind
++}
++
++func (p *RemoteParticipant) KindDetails() []livekit.ParticipantInfo_KindDetail {
++	return p.getInfo().KindDetails
++}
++
++func (p *RemoteParticipant) IsRecorder() bool {
++	info := p.getInfo()
++	return info.Kind == livekit.ParticipantInfo_EGRESS || info.Permission.GetRecorder()
++}
++
++func (p *RemoteParticipant) IsAgent() bool {
++	info := p.getInfo()
++	return info.Kind == livekit.ParticipantInfo_AGENT || info.Permission.GetAgent()
++}
++
++func (p *RemoteParticipant) IsDependent() bool {
++	return p.IsRecorder() || p.IsAgent()
++}
++
++func (p *RemoteParticipant) GetLogger() logger.Logger { return p.logger }
++
++func (p *RemoteParticipant) CanSkipBroadcast() bool { return false }
++
++func (p *RemoteParticipant) Version() utils.TimedVersion {
++	return utils.TimedVersion(0)
++}
++
++func (p *RemoteParticipant) ToProto() *livekit.ParticipantInfo {
++	return p.getInfo()
++}
++
++func (p *RemoteParticipant) ToProtoWithVersion() (*livekit.ParticipantInfo, utils.TimedVersion) {
++	return p.getInfo(), p.Version()
++}
++
++func (p *RemoteParticipant) IsPublisher() bool {
++	return p.getInfo().IsPublisher
++}
++
++func (p *RemoteParticipant) GetPublishedTrack(trackID livekit.TrackID) types.MediaTrack {
++	if t := p.getTrack(trackID); t != nil {
++		return t
++	}
++	return nil
++}
++
++func (p *RemoteParticipant) GetPublishedTracks() []types.MediaTrack {
++	p.lock.RLock()
++	defer p.lock.RUnlock()
++	tracks := make([]types.MediaTrack, 0, len(p.tracks))
++	for _, t := range p.tracks {
++		tracks = append(tracks, t)
++	}
++	return tracks
++}
++
++func (p *RemoteParticipant) RemovePublishedTrack(track types.MediaTrack, isExpectedToResume bool) {
++	p.deleteTrack(track.ID())
++}
++
++func (p *RemoteParticipant) GetPublishedDataTracks() []types.DataTrack           { return nil }
++func (p *RemoteParticipant) GetPublishedDataTrack(handle uint16) types.DataTrack { return nil }
++func (p *RemoteParticipant) RemovePublishedDataTrack(track types.DataTrack)      {}
++
++func (p *RemoteParticipant) GetAudioLevel() (float64, bool) {
++	p.lock.RLock()
++	defer p.lock.RUnlock()
++	if !p.audioActive || time.Since(p.audioAt) > remoteSpeakerTimeout {
++		return 0, false
++	}
++	return p.audioLevel, true
++}
++
++func (p *RemoteParticipant) HasPermission(trackID livekit.TrackID, subIdentity livekit.ParticipantIdentity) bool {
++	p.lock.RLock()
++	defer p.lock.RUnlock()
++	perm := p.permission
++	if perm == nil || perm.AllParticipants {
++		return true
++	}
++	for _, tp := range perm.TrackPermissions {
++		if livekit.ParticipantIdentity(tp.ParticipantIdentity) != subIdentity {
++			continue
++		}
++		if tp.AllTracks {
++			return true
++		}
++		for _, sid := range tp.TrackSids {
++			if livekit.TrackID(sid) == trackID {
++				return true
++			}
++		}
++		return false
++	}
++	return false
++}
++
++func (p *RemoteParticipant) Hidden() bool {
++	return p.getInfo().Permission.GetHidden()
++}
++
++func (p *RemoteParticipant) MigrateState() types.MigrateState { return types.MigrateStateComplete }
++
++func (p *RemoteParticipant) Close(sendLeave bool, reason types.ParticipantCloseReason, isExpectedToResume bool) error {
++	p.markDisconnected()
++	for _, t := range p.remoteTracks() {
++		t.Close(false)
++	}
++	return nil
++}
++
++func (p *RemoteParticipant) IsClosed() bool {
++	p.lock.RLock()
++	defer p.lock.RUnlock()
++	return p.closed
++}
++
++func (p *RemoteParticipant) IsDisconnected() bool {
++	return p.IsClosed() || p.State() == livekit.ParticipantInfo_DISCONNECTED
++}
++
++func (p *RemoteParticipant) SubscriptionPermission() (*livekit.SubscriptionPermission, utils.TimedVersion) {
++	p.lock.RLock()
++	defer p.lock.RUnlock()
++	return p.permission, utils.TimedVersion(0)
++}
++
++func (p *RemoteParticipant) UpdateSubscriptionPermission(
++	_ *livekit.SubscriptionPermission,
++	_ utils.TimedVersion,
++	_ func(participantID livekit.ParticipantID) types.LocalParticipant,
++) error {
++	// permissions of remote participants are owned by their hosting node
++	return nil
++}
++
++func (p *RemoteParticipant) DebugInfo() map[string]any {
++	info := p.getInfo()
++	return map[string]any{
++		"ID":       info.Sid,
++		"Identity": info.Identity,
++		"State":    info.State.String(),
++		"NodeID":   p.nodeID,
++		"Remote":   true,
++	}
++}
++
++func (p *RemoteParticipant) HandleReceivedDataTrackMessage([]byte, *datatrack.Packet, int64) {}
++
++func (p *RemoteParticipant) GetParticipantListener() types.ParticipantListener {
++	return &types.NullParticipantListener{}
++}
++
++func (p *RemoteParticipant) AddDataBlob(*livekit.DataBlob)                      {}
++func (p *RemoteParticipant) GetDataBlob(*livekit.DataBlobKey) *livekit.DataBlob { return nil }
+diff --git a/pkg/distributed/remotetrack.go b/pkg/distributed/remotetrack.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..f57edf85a6f354a2844bfc7690f3cd38fe87aa29
+--- /dev/null
++++ b/pkg/distributed/remotetrack.go
+@@ -0,0 +1,119 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"github.com/pion/rtcp"
++	"go.uber.org/atomic"
++	"google.golang.org/protobuf/proto"
++
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/observability/roomobs"
++
++	"github.com/livekit/livekit-server/pkg/rtc"
++	"github.com/livekit/livekit-server/pkg/rtc/types"
++)
++
++// remoteTrack is a track published on another node. It is a regular
++// rtc.MediaTrack, whose receivers are fed by the relay connection to the
++// publisher's node. Media is only relayed while local subscribers exist.
++type remoteTrack struct {
++	*rtc.MediaTrack
++
++	publisher *RemoteParticipant
++	conn      *relayConn
++
++	relayRequested atomic.Bool
++}
++
++var _ types.MediaTrack = (*remoteTrack)(nil)
++
++func newRemoteTrack(rs *roomState, conn *relayConn, publisher *RemoteParticipant, ti *livekit.TrackInfo) *remoteTrack {
++	t := &remoteTrack{
++		publisher: publisher,
++		conn:      conn,
++	}
++	info := publisher.getInfo()
++	t.MediaTrack = rtc.NewMediaTrack(rtc.MediaTrackParams{
++		ParticipantID:          publisher.ID,
++		ParticipantIdentity:    publisher.Identity(),
++		ParticipantVersion:     info.Version,
++		ParticipantKind:        info.Kind,
++		ParticipantKindDetails: info.KindDetails,
++		BufferFactory:          conn.bufferFactory,
++		ReceiverConfig:         rs.m.rtcConf.Receiver,
++		SubscriberConfig:       rs.m.rtcConf.Subscriber,
++		AudioConfig:            rs.m.fullConf.Audio,
++		VideoConfig:            rs.m.fullConf.Video,
++		PLIThrottleConfig:      rs.m.fullConf.RTC.PLIThrottle,
++		TelemetryListener: func() types.ParticipantTelemetryListener {
++			return &types.NullParticipantTelemetryListener{}
++		},
++		Logger:   rtc.LoggerWithTrack(publisher.GetLogger(), livekit.TrackID(ti.Sid), true),
++		Reporter: roomobs.NewNoopTrackReporter(),
++		OnRTCP: func(pkts []rtcp.Packet) {
++			conn.writeRTCP(pkts)
++		},
++		ShouldRegressCodec:              func() bool { return false },
++		EnableRTPStreamRestartDetection: rs.m.fullConf.RTC.EnableRTPStreamRestartDetection,
++		OnSubscribedMaxQualityChange: func(
++			trackID livekit.TrackID,
++			_ *livekit.TrackInfo,
++			subscribedQualities []*livekit.SubscribedCodec,
++			_ []types.SubscribedCodecQuality,
++		) error {
++			conn.sendSubscribedQualities(trackID, subscribedQualities)
++			return nil
++		},
++		OnSubscribedAudioCodecChange: func(livekit.TrackID, []*livekit.SubscribedAudioCodec) error {
++			return nil
++		},
++	}, ti)
++	return t
++}
++
++// AddSubscriber starts relaying the track from the publisher's node on first use.
++// Until the relayed media arrives, the subscription manager retries on ErrNoReceiver.
++func (t *remoteTrack) AddSubscriber(sub types.LocalParticipant) (types.SubscribedTrack, error) {
++	if !t.relayRequested.Swap(true) {
++		t.conn.requestTrack(t)
++	}
++	return t.MediaTrack.AddSubscriber(sub)
++}
++
++func (t *remoteTrack) Close(isExpectedToResume bool) {
++	if t.relayRequested.Swap(false) {
++		t.conn.releaseTrack(t)
++	}
++	t.MediaTrack.Close(isExpectedToResume)
++}
++
++// relayTrackInfo returns the track info for the receiving side of the relay.
++// Relayed streams use their own SSRCs, the publisher's SSRCs in the layers
++// would prevent the receiver from registering them ("not overriding ssrc").
++func relayTrackInfo(ti *livekit.TrackInfo) *livekit.TrackInfo {
++	ti = proto.CloneOf(ti)
++	clear := func(layers []*livekit.VideoLayer) {
++		for _, l := range layers {
++			l.Ssrc = 0
++			l.RepairSsrc = 0
++		}
++	}
++	clear(ti.Layers)
++	for _, c := range ti.Codecs {
++		clear(c.Layers)
++	}
++	return ti
++}
+diff --git a/pkg/distributed/roomstate.go b/pkg/distributed/roomstate.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf12d019f060aa0a8b03b9e15cdd2c0ed7d8716f
+--- /dev/null
++++ b/pkg/distributed/roomstate.go
+@@ -0,0 +1,527 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"context"
++	"sync"
++	"time"
++
++	"go.uber.org/atomic"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/logger"
++	"github.com/livekit/psrpc/pkg/bus"
++
++	"github.com/livekit/livekit-server/pkg/rtc"
++	"github.com/livekit/livekit-server/pkg/rtc/types"
++)
++
++const publishTimeout = 3 * time.Second
++
++// roomState is the distributed part of a room on this node. It mirrors the
++// participants of the other nodes into the local rtc.Room and publishes the
++// local participants to the other nodes.
++type roomState struct {
++	m      *Manager
++	room   *rtc.Room
++	logger logger.Logger
++
++	ctx    context.Context
++	cancel context.CancelFunc
++
++	lock         sync.Mutex
++	remote       map[livekit.ParticipantIdentity]*RemoteParticipant
++	conns        map[livekit.NodeID]*relayConn
++	lastMetadata string
++	lastSpeakers map[livekit.ParticipantID]speaker
++
++	closingFromRemote atomic.Bool
++	closeOnce         sync.Once
++}
++
++var _ rtc.DistributedRoomListener = (*roomState)(nil)
++
++func newRoomState(m *Manager, room *rtc.Room) *roomState {
++	rs := &roomState{
++		m:            m,
++		room:         room,
++		logger:       room.Logger().WithComponent("distributed"),
++		remote:       make(map[livekit.ParticipantIdentity]*RemoteParticipant),
++		conns:        make(map[livekit.NodeID]*relayConn),
++		lastMetadata: room.ToProto().Metadata,
++	}
++	rs.ctx, rs.cancel = context.WithCancel(m.ctx)
++	return rs
++}
++
++func (rs *roomState) nodeID() livekit.NodeID {
++	return rs.m.currentNode.NodeID()
++}
++
++func (rs *roomState) start() {
++	sub, err := subscribe(rs.ctx, rs.m.bus, roomChannel(rs.room.Name()))
++	if err != nil {
++		rs.logger.Errorw("could not subscribe to distributed room channel", err)
++		return
++	}
++	rs.room.SetDistributedListener(rs)
++
++	go rs.readWorker(sub)
++	go rs.speakerWorker()
++	go rs.nodeCheckWorker()
++
++	// ask the other nodes for their participants
++	rs.publish(&message{Type: msgSyncRequest})
++	rs.publishAllLocalParticipants()
++}
++
++func (rs *roomState) close() {
++	rs.closeOnce.Do(func() {
++		rs.cancel()
++
++		rs.lock.Lock()
++		conns := rs.conns
++		rs.conns = make(map[livekit.NodeID]*relayConn)
++		remote := rs.remote
++		rs.remote = make(map[livekit.ParticipantIdentity]*RemoteParticipant)
++		rs.lock.Unlock()
++
++		for _, rp := range remote {
++			_ = rp.Close(false, types.ParticipantCloseReasonRoomClosed, false)
++		}
++		for _, c := range conns {
++			c.close()
++		}
++	})
++}
++
++func (rs *roomState) publish(msg *message) {
++	rs.publishWithContext(rs.ctx, msg)
++}
++
++func (rs *roomState) publishWithContext(ctx context.Context, msg *message) {
++	msg.Node = rs.nodeID()
++	msg.Room = rs.room.Name()
++	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
++	defer cancel()
++	if err := publish(ctx, rs.m.bus, roomChannel(rs.room.Name()), msg); err != nil && rs.ctx.Err() == nil {
++		rs.logger.Warnw("could not publish distributed room message", err, "type", msg.Type)
++	}
++}
++
++// --- local -> remote ---
++
++func (rs *roomState) onLocalRoomClosed(reason types.RoomCloseReason) {
++	// publish with a fresh context, the room context is about to be cancelled
++	ctx := context.Background()
++	if reason == types.RoomCloseReasonAPIDelete && !rs.closingFromRemote.Load() {
++		rs.publishWithContext(ctx, &message{Type: msgRoomClose})
++	}
++	rs.publishWithContext(ctx, &message{Type: msgNodeLeft})
++}
++
++func (rs *roomState) onParticipantChanged(p types.Participant) {
++	if rtc.IsRemoteParticipant(p) {
++		return
++	}
++	if p.IsDisconnected() {
++		rs.onLocalParticipantLeft(p)
++	}
++	rs.publishLocalParticipant(p)
++}
++
++func (rs *roomState) publishLocalParticipant(p types.Participant) {
++	info := p.ToProto()
++	if p.IsDisconnected() {
++		info = proto.CloneOf(info)
++		info.State = livekit.ParticipantInfo_DISCONNECTED
++	}
++	perm, _ := p.SubscriptionPermission()
++	perm = rs.resolvePermissionIdentities(perm)
++	rs.publish(&message{
++		Type:                   msgParticipantUpdate,
++		Participant:            marshalProto(info),
++		SubscriptionPermission: marshalProto(perm),
++	})
++}
++
++// resolvePermissionIdentities fills in identities for permissions given by
++// participant ID, other nodes evaluate permissions by identity.
++func (rs *roomState) resolvePermissionIdentities(perm *livekit.SubscriptionPermission) *livekit.SubscriptionPermission {
++	if perm == nil {
++		return nil
++	}
++	perm = proto.CloneOf(perm)
++	for _, tp := range perm.TrackPermissions {
++		if tp.ParticipantIdentity == "" && tp.ParticipantSid != "" {
++			tp.ParticipantIdentity = string(rs.room.GetParticipantIdentityByID(livekit.ParticipantID(tp.ParticipantSid)))
++		}
++	}
++	return perm
++}
++
++// OnLocalSubscriptionPermissionChanged implements rtc.DistributedRoomListener.
++func (rs *roomState) OnLocalSubscriptionPermissionChanged(p types.LocalParticipant) {
++	rs.publishLocalParticipant(p)
++}
++
++func (rs *roomState) publishAllLocalParticipants() {
++	for _, p := range rs.room.GetParticipants() {
++		rs.publishLocalParticipant(p)
++	}
++}
++
++func (rs *roomState) onLocalParticipantLeft(p types.Participant) {
++	// the identity might already have re-joined (e.g. duplicate identity replacement)
++	if lp := rs.room.GetParticipant(p.Identity()); lp != nil && lp.ID() != p.ID() {
++		return
++	}
++	if err := rs.m.store.RemoveParticipantNode(rs.ctx, rs.room.Name(), p.Identity(), rs.nodeID()); err != nil && rs.ctx.Err() == nil {
++		rs.logger.Warnw("could not remove participant placement", err, "participant", p.Identity())
++	}
++}
++
++// OnLocalDataPacket implements rtc.DistributedRoomListener.
++func (rs *roomState) OnLocalDataPacket(_ types.LocalParticipant, kind livekit.DataPacket_Kind, dp *livekit.DataPacket) {
++	if !rs.hasRemoteNodes() {
++		return
++	}
++	rs.publish(&message{
++		Type:       msgDataPacket,
++		DataKind:   kind,
++		DataPacket: marshalProto(dp),
++	})
++}
++
++func (rs *roomState) onRoomUpdated() {
++	metadata := rs.room.ToProto().Metadata
++	rs.lock.Lock()
++	changed := metadata != rs.lastMetadata
++	rs.lastMetadata = metadata
++	rs.lock.Unlock()
++	if changed {
++		rs.publish(&message{Type: msgRoomMetadata, Metadata: metadata})
++	}
++}
++
++func (rs *roomState) hasRemoteNodes() bool {
++	rs.lock.Lock()
++	defer rs.lock.Unlock()
++	return len(rs.remote) != 0
++}
++
++// speakerWorker publishes the audio levels of local speakers, so that remote
++// participants take part in the active speaker detection of the other nodes.
++func (rs *roomState) speakerWorker() {
++	interval := time.Duration(rs.m.fullConf.Audio.UpdateInterval) * time.Millisecond
++	if interval <= 0 {
++		interval = 400 * time.Millisecond
++	}
++	ticker := time.NewTicker(interval)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-rs.ctx.Done():
++			return
++		case <-ticker.C:
++		}
++
++		active := rs.room.GetLocalActiveSpeakers()
++		next := make(map[livekit.ParticipantID]speaker, len(active))
++		var speakers []speaker
++		for _, s := range active {
++			sp := speaker{ParticipantID: livekit.ParticipantID(s.Sid), Level: s.Level, Active: true}
++			next[sp.ParticipantID] = sp
++			speakers = append(speakers, sp)
++		}
++		rs.lock.Lock()
++		for pID := range rs.lastSpeakers {
++			if _, ok := next[pID]; !ok {
++				speakers = append(speakers, speaker{ParticipantID: pID})
++			}
++		}
++		rs.lastSpeakers = next
++		rs.lock.Unlock()
++
++		// active speakers are refreshed periodically, remote levels time out otherwise
++		if len(speakers) != 0 && rs.hasRemoteNodes() {
++			rs.publish(&message{Type: msgSpeakers, Speakers: speakers})
++		}
++	}
++}
++
++// --- remote -> local ---
++
++func (rs *roomState) readWorker(sub bus.Subscription[*wrapperspb.BytesValue]) {
++	defer func() { _ = sub.Close() }()
++	for {
++		select {
++		case <-rs.ctx.Done():
++			return
++		case v, ok := <-sub.Channel():
++			if !ok {
++				return
++			}
++			msg, err := decode(v)
++			if err != nil {
++				rs.logger.Warnw("could not decode distributed room message", err)
++				continue
++			}
++			if msg.Node == rs.nodeID() {
++				continue
++			}
++			rs.handleMessage(msg)
++		}
++	}
++}
++
++func (rs *roomState) handleMessage(msg *message) {
++	switch msg.Type {
++	case msgParticipantUpdate:
++		info := &livekit.ParticipantInfo{}
++		if err := proto.Unmarshal(msg.Participant, info); err != nil {
++			rs.logger.Warnw("could not decode participant", err)
++			return
++		}
++		var perm *livekit.SubscriptionPermission
++		if len(msg.SubscriptionPermission) != 0 {
++			perm = &livekit.SubscriptionPermission{}
++			if err := proto.Unmarshal(msg.SubscriptionPermission, perm); err != nil {
++				perm = nil
++			}
++		}
++		rs.handleParticipantUpdate(msg.Node, info, perm)
++
++	case msgSyncRequest:
++		rs.publishAllLocalParticipants()
++
++	case msgDataPacket:
++		dp := &livekit.DataPacket{}
++		if err := proto.Unmarshal(msg.DataPacket, dp); err != nil {
++			rs.logger.Warnw("could not decode data packet", err)
++			return
++		}
++		rs.room.DeliverRemoteDataPacket(msg.DataKind, dp)
++
++	case msgSpeakers:
++		rs.lock.Lock()
++		byID := make(map[livekit.ParticipantID]*RemoteParticipant, len(rs.remote))
++		for _, rp := range rs.remote {
++			byID[rp.ID()] = rp
++		}
++		rs.lock.Unlock()
++		for _, s := range msg.Speakers {
++			if rp := byID[s.ParticipantID]; rp != nil {
++				rp.setAudioLevel(float64(s.Level), s.Active)
++			}
++		}
++
++	case msgRoomMetadata:
++		rs.lock.Lock()
++		rs.lastMetadata = msg.Metadata
++		rs.lock.Unlock()
++		if rs.room.ToProto().Metadata != msg.Metadata {
++			rs.room.SetMetadata(msg.Metadata)
++		}
++
++	case msgRoomClose:
++		rs.logger.Infow("room deleted on another node", "remoteNodeID", msg.Node)
++		rs.closingFromRemote.Store(true)
++		go rs.room.Close(types.RoomCloseReasonAPIDelete)
++
++	case msgNodeLeft:
++		rs.removeNode(msg.Node, "node left room")
++	}
++}
++
++func (rs *roomState) handleParticipantUpdate(nodeID livekit.NodeID, info *livekit.ParticipantInfo, perm *livekit.SubscriptionPermission) {
++	identity := livekit.ParticipantIdentity(info.Identity)
++
++	if lp := rs.room.GetParticipant(identity); lp != nil && !lp.IsDisconnected() && info.State != livekit.ParticipantInfo_DISCONNECTED {
++		// identity is hosted locally now (e.g. after a failover), the remote session is stale
++		rs.logger.Debugw("ignoring remote update for local participant", "participant", identity, "remoteNodeID", nodeID)
++		return
++	}
++
++	rs.lock.Lock()
++	rp := rs.remote[identity]
++	rs.lock.Unlock()
++
++	if info.State == livekit.ParticipantInfo_DISCONNECTED {
++		if rp != nil && rp.ID() == livekit.ParticipantID(info.Sid) {
++			rs.removeRemoteParticipant(rp)
++		}
++		return
++	}
++
++	if rp != nil && (rp.ID() != livekit.ParticipantID(info.Sid) || rp.NodeID() != nodeID) {
++		// a new session of the identity replaced the old one
++		rs.removeRemoteParticipant(rp)
++		rp = nil
++	}
++
++	if rp == nil {
++		rp = newRemoteParticipant(nodeID, info, rs.logger)
++		rp.update(info, perm)
++		rs.lock.Lock()
++		rs.remote[identity] = rp
++		rs.lock.Unlock()
++
++		rs.logger.Infow("remote participant joined", "participant", identity, "pID", info.Sid, "remoteNodeID", nodeID)
++		rs.room.AddRemoteParticipant(rp)
++		rs.syncTracks(rp, info)
++		return
++	}
++
++	if !rp.update(info, perm) {
++		return
++	}
++	rs.syncTracks(rp, info)
++	rs.room.UpdateRemoteParticipant(rp)
++}
++
++func (rs *roomState) syncTracks(rp *RemoteParticipant, info *livekit.ParticipantInfo) {
++	seen := make(map[livekit.TrackID]struct{}, len(info.Tracks))
++	for _, ti := range info.Tracks {
++		trackID := livekit.TrackID(ti.Sid)
++		seen[trackID] = struct{}{}
++
++		if t := rp.getTrack(trackID); t != nil {
++			t.UpdateTrackInfo(relayTrackInfo(ti))
++			if t.IsMuted() != ti.Muted {
++				t.SetMuted(ti.Muted)
++			}
++			continue
++		}
++
++		conn := rs.getOrCreateConn(rp.NodeID())
++		if conn == nil {
++			return
++		}
++		t := newRemoteTrack(rs, conn, rp, relayTrackInfo(ti))
++		rp.setTrack(t)
++		rs.room.AddRemoteTrack(rp, t)
++	}
++
++	for _, t := range rp.remoteTracks() {
++		if _, ok := seen[t.ID()]; ok {
++			continue
++		}
++		rp.deleteTrack(t.ID())
++		rs.room.RemoveRemoteTrack(rp, t)
++		t.Close(false)
++	}
++}
++
++func (rs *roomState) removeRemoteParticipant(rp *RemoteParticipant) {
++	rs.lock.Lock()
++	if rs.remote[rp.Identity()] == rp {
++		delete(rs.remote, rp.Identity())
++	}
++	rs.lock.Unlock()
++
++	rs.logger.Infow("remote participant left", "participant", rp.Identity(), "pID", rp.ID(), "remoteNodeID", rp.NodeID())
++	rp.markDisconnected()
++	rs.room.RemoveRemoteParticipant(rp)
++	for _, t := range rp.remoteTracks() {
++		rp.deleteTrack(t.ID())
++		t.Close(false)
++	}
++}
++
++// removeNode drops all participants and the relay connection of a node.
++func (rs *roomState) removeNode(nodeID livekit.NodeID, reason string) []*RemoteParticipant {
++	rs.lock.Lock()
++	var participants []*RemoteParticipant
++	for _, rp := range rs.remote {
++		if rp.NodeID() == nodeID {
++			participants = append(participants, rp)
++		}
++	}
++	conn := rs.conns[nodeID]
++	delete(rs.conns, nodeID)
++	rs.lock.Unlock()
++
++	if len(participants) != 0 || conn != nil {
++		rs.logger.Infow("removing remote node from room", "remoteNodeID", nodeID, "reason", reason, "numParticipants", len(participants))
++	}
++	for _, rp := range participants {
++		rs.removeRemoteParticipant(rp)
++	}
++	if conn != nil {
++		conn.close()
++	}
++	return participants
++}
++
++func (rs *roomState) getOrCreateConn(nodeID livekit.NodeID) *relayConn {
++	rs.lock.Lock()
++	defer rs.lock.Unlock()
++	if rs.ctx.Err() != nil {
++		return nil
++	}
++	c := rs.conns[nodeID]
++	if c == nil {
++		c = newRelayConn(rs, nodeID)
++		rs.conns[nodeID] = c
++	}
++	return c
++}
++
++func (rs *roomState) getConn(nodeID livekit.NodeID) *relayConn {
++	rs.lock.Lock()
++	defer rs.lock.Unlock()
++	return rs.conns[nodeID]
++}
++
++// handleRelayMessage handles relay control messages of a peer node.
++func (rs *roomState) handleRelayMessage(msg *message) {
++	conn := rs.getOrCreateConn(msg.Node)
++	if conn == nil {
++		return
++	}
++	switch msg.Type {
++	case msgRelaySubscribe:
++		if s := conn.getOrCreateSender(); s != nil {
++			s.addTrack(msg.TrackID)
++		}
++	case msgRelayUnsubscribe:
++		if s := conn.getSender(); s != nil {
++			s.removeTrack(msg.TrackID)
++		}
++	case msgRelayQuality:
++		if s := conn.getSender(); s != nil {
++			s.handleQualities(msg.TrackID, msg.Qualities)
++		}
++	case msgRelayAnswer:
++		if s := conn.getSender(); s != nil {
++			s.handleAnswer(msg.SessionID, msg.SDP)
++		}
++	case msgRelayOffer:
++		conn.handleOffer(msg.SessionID, msg.SDP)
++	case msgRelayCandidate:
++		if msg.ToSender {
++			if s := conn.getSender(); s != nil {
++				s.addCandidate(msg.SessionID, msg.Candidate)
++			}
++		} else {
++			conn.addRecvCandidate(msg.SessionID, msg.Candidate)
++		}
++	}
++}
+diff --git a/pkg/distributed/store.go b/pkg/distributed/store.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..f19d177407ad11afd2de665a0a3efa6bdb90c9d5
+--- /dev/null
++++ b/pkg/distributed/store.go
+@@ -0,0 +1,261 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package distributed
++
++import (
++	"context"
++	"errors"
++	"time"
++
++	"github.com/redis/go-redis/v9"
++
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/utils"
++)
++
++const (
++	// hash: node_id => unix time the node started hosting the room
++	roomNodesKeyPrefix = "dist:room_nodes:"
++	// hash: participant identity => node_id hosting the participant
++	participantNodeKeyPrefix = "dist:participant_node:"
++	// hash: misc. per room state (e.g. which node dispatched room agents)
++	roomMetaKeyPrefix = "dist:room_meta:"
++	// string: short lived placement lock
++	placementLockKeyPrefix = "dist:placement_lock:"
++	// hash: node_id => relay address (ip:port), for operations and tests
++	nodeRelayKey = "dist:node_relay"
++
++	roomMetaAgentsNode = "agents_node"
++
++	placementLockTTL = 3 * time.Second
++)
++
++var ErrPlacementLockTimeout = errors.New("could not acquire placement lock")
++
++// removes a hash field only if it still holds the expected value
++var hdelIfEqualScript = redis.NewScript(`
++if redis.call("HGET", KEYS[1], ARGV[1]) == ARGV[2] then
++	return redis.call("HDEL", KEYS[1], ARGV[1])
++end
++return 0
++`)
++
++// adds a node to the room and returns the number of nodes
++var addRoomNodeScript = redis.NewScript(`
++redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
++return redis.call("HLEN", KEYS[1])
++`)
++
++// removes a node from the room and returns the number of remaining nodes,
++// or -1 when the node was not registered (anymore)
++var removeRoomNodeScript = redis.NewScript(`
++if redis.call("HDEL", KEYS[1], ARGV[1]) == 0 then
++	return -1
++end
++return redis.call("HLEN", KEYS[1])
++`)
++
++// deletes the lock only if it is still owned by the caller
++var unlockScript = redis.NewScript(`
++if redis.call("GET", KEYS[1]) == ARGV[1] then
++	return redis.call("DEL", KEYS[1])
++end
++return 0
++`)
++
++// Store keeps the cluster wide state of distributed rooms in Redis.
++type Store struct {
++	rc redis.UniversalClient
++}
++
++func NewStore(rc redis.UniversalClient) *Store {
++	return &Store{rc: rc}
++}
++
++func roomNodesKey(roomName livekit.RoomName) string {
++	return roomNodesKeyPrefix + string(roomName)
++}
++
++func participantNodeKey(roomName livekit.RoomName) string {
++	return participantNodeKeyPrefix + string(roomName)
++}
++
++func roomMetaKey(roomName livekit.RoomName) string {
++	return roomMetaKeyPrefix + string(roomName)
++}
++
++// AddRoomNode registers nodeID as a host of the room and returns the number of nodes hosting the room.
++func (s *Store) AddRoomNode(ctx context.Context, roomName livekit.RoomName, nodeID livekit.NodeID) (int, error) {
++	return addRoomNodeScript.Run(ctx, s.rc, []string{roomNodesKey(roomName)}, string(nodeID), time.Now().Unix()).Int()
++}
++
++// RemoveRoomNode unregisters nodeID and returns the number of nodes still
++// hosting the room. lastNode is true for exactly one caller: the one that
++// removed the last node of the room.
++func (s *Store) RemoveRoomNode(ctx context.Context, roomName livekit.RoomName, nodeID livekit.NodeID) (remaining int, lastNode bool, err error) {
++	n, err := removeRoomNodeScript.Run(ctx, s.rc, []string{roomNodesKey(roomName)}, string(nodeID)).Int()
++	if err != nil {
++		return 0, false, err
++	}
++	if n < 0 {
++		return 0, false, nil
++	}
++	return n, n == 0, nil
++}
++
++// GetRoomNodes returns the nodes hosting the room.
++func (s *Store) GetRoomNodes(ctx context.Context, roomName livekit.RoomName) ([]livekit.NodeID, error) {
++	keys, err := s.rc.HKeys(ctx, roomNodesKey(roomName)).Result()
++	if err != nil {
++		return nil, err
++	}
++	return livekit.StringsAsIDs[livekit.NodeID](keys), nil
++}
++
++// SetParticipantNode records the node a participant is (or will be) hosted on.
++func (s *Store) SetParticipantNode(ctx context.Context, roomName livekit.RoomName, identity livekit.ParticipantIdentity, nodeID livekit.NodeID) error {
++	return s.rc.HSet(ctx, participantNodeKey(roomName), string(identity), string(nodeID)).Err()
++}
++
++// GetParticipantNode returns the node hosting the participant, "" if unknown.
++func (s *Store) GetParticipantNode(ctx context.Context, roomName livekit.RoomName, identity livekit.ParticipantIdentity) (livekit.NodeID, error) {
++	nodeID, err := s.rc.HGet(ctx, participantNodeKey(roomName), string(identity)).Result()
++	if errors.Is(err, redis.Nil) {
++		return "", nil
++	}
++	return livekit.NodeID(nodeID), err
++}
++
++// RemoveParticipantNode removes the participant mapping if it still points to nodeID.
++func (s *Store) RemoveParticipantNode(ctx context.Context, roomName livekit.RoomName, identity livekit.ParticipantIdentity, nodeID livekit.NodeID) error {
++	return hdelIfEqualScript.Run(ctx, s.rc, []string{participantNodeKey(roomName)}, string(identity), string(nodeID)).Err()
++}
++
++// GetParticipantNodes returns identity => node for all participants of the room.
++func (s *Store) GetParticipantNodes(ctx context.Context, roomName livekit.RoomName) (map[livekit.ParticipantIdentity]livekit.NodeID, error) {
++	all, err := s.rc.HGetAll(ctx, participantNodeKey(roomName)).Result()
++	if err != nil {
++		return nil, err
++	}
++	res := make(map[livekit.ParticipantIdentity]livekit.NodeID, len(all))
++	for identity, nodeID := range all {
++		res[livekit.ParticipantIdentity(identity)] = livekit.NodeID(nodeID)
++	}
++	return res, nil
++}
++
++// RemoveNode removes all state of a (dead) node from the room. lastNode is
++// true when it was the last node of the room.
++func (s *Store) RemoveNode(ctx context.Context, roomName livekit.RoomName, nodeID livekit.NodeID) (lastNode bool, err error) {
++	participants, err := s.GetParticipantNodes(ctx, roomName)
++	if err != nil {
++		return false, err
++	}
++	for identity, pNodeID := range participants {
++		if pNodeID == nodeID {
++			if err := s.RemoveParticipantNode(ctx, roomName, identity, nodeID); err != nil {
++				return false, err
++			}
++		}
++	}
++	_, lastNode, err = s.RemoveRoomNode(ctx, roomName, nodeID)
++	return lastNode, err
++}
++
++// ClaimRoomAgents returns true for exactly one node of the room, which is then
++// responsible for dispatching room level agents.
++func (s *Store) ClaimRoomAgents(ctx context.Context, roomName livekit.RoomName, nodeID livekit.NodeID) (bool, error) {
++	ok, err := s.rc.HSetNX(ctx, roomMetaKey(roomName), roomMetaAgentsNode, string(nodeID)).Result()
++	if err != nil {
++		return false, err
++	}
++	if ok {
++		return true, nil
++	}
++	owner, err := s.rc.HGet(ctx, roomMetaKey(roomName), roomMetaAgentsNode).Result()
++	if err != nil {
++		return false, err
++	}
++	return owner == string(nodeID), nil
++}
++
++// SetNodeRelayAddress publishes the relay address of a node.
++func (s *Store) SetNodeRelayAddress(ctx context.Context, nodeID livekit.NodeID, addr string) error {
++	return s.rc.HSet(ctx, nodeRelayKey, string(nodeID), addr).Err()
++}
++
++// GetNodeRelayAddress returns the relay address of a node, "" if unknown.
++func (s *Store) GetNodeRelayAddress(ctx context.Context, nodeID livekit.NodeID) (string, error) {
++	addr, err := s.rc.HGet(ctx, nodeRelayKey, string(nodeID)).Result()
++	if errors.Is(err, redis.Nil) {
++		return "", nil
++	}
++	return addr, err
++}
++
++// PruneNodeRelayAddresses removes the relay addresses of all nodes not in keep.
++func (s *Store) PruneNodeRelayAddresses(ctx context.Context, keep map[livekit.NodeID]bool) ([]livekit.NodeID, error) {
++	nodeIDs, err := s.rc.HKeys(ctx, nodeRelayKey).Result()
++	if err != nil {
++		return nil, err
++	}
++	var removed []livekit.NodeID
++	for _, id := range nodeIDs {
++		if keep[livekit.NodeID(id)] {
++			continue
++		}
++		if err := s.rc.HDel(ctx, nodeRelayKey, id).Err(); err != nil {
++			return removed, err
++		}
++		removed = append(removed, livekit.NodeID(id))
++	}
++	return removed, nil
++}
++
++// RemoveNodeRelayAddress removes the relay address of a node.
++func (s *Store) RemoveNodeRelayAddress(ctx context.Context, nodeID livekit.NodeID) error {
++	return s.rc.HDel(ctx, nodeRelayKey, string(nodeID)).Err()
++}
++
++// DeleteRoom removes all distributed state of a room.
++func (s *Store) DeleteRoom(ctx context.Context, roomName livekit.RoomName) error {
++	return s.rc.Del(ctx, roomNodesKey(roomName), participantNodeKey(roomName), roomMetaKey(roomName)).Err()
++}
++
++// LockPlacement serializes participant placement for a room across the cluster.
++func (s *Store) LockPlacement(ctx context.Context, roomName livekit.RoomName) (func(), error) {
++	key := placementLockKeyPrefix + string(roomName)
++	token := utils.RandomSecret()
++	deadline := time.Now().Add(placementLockTTL)
++	for {
++		ok, err := s.rc.SetNX(ctx, key, token, placementLockTTL).Result()
++		if err != nil {
++			return nil, err
++		}
++		if ok {
++			return func() {
++				_ = unlockScript.Run(context.Background(), s.rc, []string{key}, token).Err()
++			}, nil
++		}
++		if time.Now().After(deadline) {
++			return nil, ErrPlacementLockTimeout
++		}
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-time.After(10 * time.Millisecond):
++		}
++	}
++}

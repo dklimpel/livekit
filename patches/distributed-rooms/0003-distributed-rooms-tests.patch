@@ -1,0 +1,957 @@
+diff --git a/test/distributed/README.md b/test/distributed/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..184e6a88caea8357d32cd07192071eead54201c5
+--- /dev/null
++++ b/test/distributed/README.md
+@@ -0,0 +1,11 @@
++# Distributed rooms – local test cluster
++
++Redis + 3 LiveKit nodes with distributed rooms enabled, built from this source tree.
++
++```bash
++docker compose up -d --build
++./run-tests.sh                 # go, loadtest, failover scenarios; exit code 0 = pass
++```
++
++Browser test page: http://localhost:8090. Documentation (German):
++[docs/distributed-rooms/tests.md](../../docs/distributed-rooms/tests.md).
+diff --git a/test/distributed/docker-compose.yml b/test/distributed/docker-compose.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..98884098be28532beddb2c451e456ad8cbffbbff
+--- /dev/null
++++ b/test/distributed/docker-compose.yml
+@@ -0,0 +1,159 @@
++# Local test cluster for distributed rooms: Redis + 3 LiveKit nodes.
++# See README.md in this directory.
++#
++#   docker compose up -d --build
++#
++# Ports on the host (identical inside the containers, so ICE candidates work):
++#   livekit-1: 7880 (http/ws), 7881/tcp, 7882/udp
++#   livekit-2: 7980 (http/ws), 7981/tcp, 7982/udp
++#   livekit-3: 8080 (http/ws), 8081/tcp, 8082/udp
++#   redis:     6379
++#   web:       8090 (browser test page)
++# The relay between the nodes uses 7890-7989/udp on the internal network only.
++
++x-livekit: &livekit
++  build:
++    context: ../..
++    dockerfile: Dockerfile
++  image: livekit-server-distributed:dev
++  depends_on:
++    - redis
++  restart: "no"
++
++services:
++  redis:
++    image: redis:7-alpine
++    ports:
++      - "6379:6379"
++    networks:
++      lknet:
++        ipv4_address: 172.28.0.10
++
++  livekit-1:
++    <<: *livekit
++    ports:
++      - "7880:7880"
++      - "7881:7881"
++      - "7882:7882/udp"
++    networks:
++      lknet:
++        ipv4_address: 172.28.0.11
++    environment:
++      LIVEKIT_CONFIG: |
++        port: 7880
++        log_level: ${LOG_LEVEL:-info}
++        redis:
++          address: redis:6379
++        rtc:
++          tcp_port: 7881
++          udp_port: 7882
++          use_external_ip: false
++          node_ip: 127.0.0.1
++        keys:
++          devkey: secretsecretsecretsecretsecretsecret
++        room:
++          auto_create: true
++          empty_timeout: 60
++          departure_timeout: 20
++        distributed:
++          enabled: true
++          max_participants_per_node: ${MAX_PER_NODE:-1}
++          relay:
++            port_range_start: 7890
++            port_range_end: 7989
++            node_ip: 172.28.0.11
++
++  livekit-2:
++    <<: *livekit
++    ports:
++      - "7980:7980"
++      - "7981:7981"
++      - "7982:7982/udp"
++    networks:
++      lknet:
++        ipv4_address: 172.28.0.12
++    environment:
++      LIVEKIT_CONFIG: |
++        port: 7980
++        log_level: ${LOG_LEVEL:-info}
++        redis:
++          address: redis:6379
++        rtc:
++          tcp_port: 7981
++          udp_port: 7982
++          use_external_ip: false
++          node_ip: 127.0.0.1
++        keys:
++          devkey: secretsecretsecretsecretsecretsecret
++        room:
++          auto_create: true
++          empty_timeout: 60
++          departure_timeout: 20
++        distributed:
++          enabled: true
++          max_participants_per_node: ${MAX_PER_NODE:-1}
++          relay:
++            port_range_start: 7890
++            port_range_end: 7989
++            node_ip: 172.28.0.12
++
++  livekit-3:
++    <<: *livekit
++    ports:
++      - "8080:8080"
++      - "8081:8081"
++      - "8082:8082/udp"
++    networks:
++      lknet:
++        ipv4_address: 172.28.0.13
++    environment:
++      LIVEKIT_CONFIG: |
++        port: 8080
++        log_level: ${LOG_LEVEL:-info}
++        redis:
++          address: redis:6379
++        rtc:
++          tcp_port: 8081
++          udp_port: 8082
++          use_external_ip: false
++          node_ip: 127.0.0.1
++        keys:
++          devkey: secretsecretsecretsecretsecretsecret
++        room:
++          auto_create: true
++          empty_timeout: 60
++          departure_timeout: 20
++        distributed:
++          enabled: true
++          max_participants_per_node: ${MAX_PER_NODE:-1}
++          relay:
++            port_range_start: 7890
++            port_range_end: 7989
++            node_ip: 172.28.0.13
++
++  # browser test page, http://localhost:8090
++  web:
++    image: nginx:alpine
++    ports:
++      - "8090:80"
++    volumes:
++      - ./web:/usr/share/nginx/html:ro
++    networks:
++      - lknet
++
++  # LiveKit CLI, e.g.: docker compose run --rm lk room list
++  # Uses the host network so that it reaches the nodes like a regular client.
++  lk:
++    image: ${LK_IMAGE:-livekit/livekit-cli:latest}
++    profiles: ["tools"]
++    network_mode: host
++    environment:
++      LIVEKIT_URL: ws://localhost:7880
++      LIVEKIT_API_KEY: devkey
++      LIVEKIT_API_SECRET: secretsecretsecretsecretsecretsecret
++
++networks:
++  lknet:
++    ipam:
++      config:
++        - subnet: 172.28.0.0/24
+diff --git a/test/distributed/e2e_test.go b/test/distributed/e2e_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..aab5cea297325559d5ae3fb61e16b97cea2537e6
+--- /dev/null
++++ b/test/distributed/e2e_test.go
+@@ -0,0 +1,410 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package distributed contains end-to-end tests for distributed rooms. They run
++// against an already running cluster (see test/distributed/README.md) and are
++// skipped unless LIVEKIT_DISTRIBUTED_E2E=1 is set.
++package distributed
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"os"
++	"os/exec"
++	"slices"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/pion/webrtc/v4"
++	"github.com/redis/go-redis/v9"
++	"github.com/stretchr/testify/require"
++	"github.com/twitchtv/twirp"
++
++	"github.com/livekit/protocol/auth"
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/utils/guid"
++
++	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
++	"github.com/livekit/livekit-server/pkg/testutils"
++	testclient "github.com/livekit/livekit-server/test/client"
++)
++
++func TestMain(m *testing.M) {
++	// the test client uses the server's transport, which records metrics
++	prometheus.Init("test", livekit.NodeType_SERVER)
++	os.Exit(m.Run())
++}
++
++type cluster struct {
++	urls      []string
++	apiKey    string
++	apiSecret string
++}
++
++func getCluster(t *testing.T) *cluster {
++	if os.Getenv("LIVEKIT_DISTRIBUTED_E2E") != "1" {
++		t.Skip("set LIVEKIT_DISTRIBUTED_E2E=1 to run distributed room end-to-end tests against a running cluster")
++	}
++	c := &cluster{
++		urls:      strings.Split(getenv("LIVEKIT_NODE_URLS", "ws://localhost:7880,ws://localhost:7980,ws://localhost:8080"), ","),
++		apiKey:    getenv("LIVEKIT_API_KEY", "devkey"),
++		apiSecret: getenv("LIVEKIT_API_SECRET", "secretsecretsecretsecretsecretsecret"),
++	}
++	return c
++}
++
++func getenv(key, def string) string {
++	if v := os.Getenv(key); v != "" {
++		return v
++	}
++	return def
++}
++
++// clientOptions returns the test client options. LIVEKIT_E2E_SIGNALLING=v1
++// uses the single peer connection signalling (/rtc/v1) of current browser SDKs,
++// the default is the classic signalling with two peer connections (/rtc).
++func clientOptions() *testclient.Options {
++	opts := &testclient.Options{AutoSubscribe: true}
++	if os.Getenv("LIVEKIT_E2E_SIGNALLING") == "v1" {
++		opts.RTCServicePath = "/rtc/v1"
++		opts.UseJoinRequestQueryParam = true
++	}
++	return opts
++}
++
++// join connects a participant through the signal node at urls[idx]. The
++// cluster decides on which node the participant is hosted.
++func (c *cluster) join(t *testing.T, room string, identity string, idx int) *testclient.RTCClient {
++	at := auth.NewAccessToken(c.apiKey, c.apiSecret).SetIdentity(identity).SetName(identity)
++	at.SetVideoGrant(&auth.VideoGrant{RoomJoin: true, Room: room})
++	token, err := at.ToJWT()
++	require.NoError(t, err)
++
++	opts := clientOptions()
++	url := c.urls[idx%len(c.urls)]
++	ws, err := testclient.NewWebSocketConn(url, token, opts)
++	require.NoError(t, err, "could not connect to %s", url)
++	client, err := testclient.NewRTCClient(ws, opts.UseJoinRequestQueryParam, opts)
++	require.NoError(t, err)
++	go func() { _ = client.Run() }()
++	require.NoError(t, client.WaitUntilConnected(10*time.Second), "%s did not connect", identity)
++	t.Cleanup(client.Stop)
++	return client
++}
++
++func identities(infos []*livekit.ParticipantInfo) []string {
++	var ids []string
++	for _, pi := range infos {
++		ids = append(ids, pi.Identity)
++	}
++	return ids
++}
++
++func waitForParticipants(t *testing.T, c *testclient.RTCClient, expected ...string) {
++	testutils.WithTimeout(t, func() string {
++		got := identities(c.RemoteParticipants())
++		for _, e := range expected {
++			found := false
++			for _, g := range got {
++				found = found || g == e
++			}
++			if !found {
++				return fmt.Sprintf("participant %s not visible, got %v", e, got)
++			}
++		}
++		return ""
++	}, 15*time.Second)
++}
++
++// TestDistributedRoom runs all scenarios in one room with participants spread
++// over the nodes (requires distributed.max_participants_per_node: 1).
++func TestDistributedRoom(t *testing.T) {
++	c := getCluster(t)
++	room := "dist-" + guid.New("")
++
++	alice := c.join(t, room, "alice", 0)
++	bob := c.join(t, room, "bob", 1)
++	carol := c.join(t, room, "carol", 2)
++
++	t.Run("participants see each other across nodes", func(t *testing.T) {
++		waitForParticipants(t, alice, "bob", "carol")
++		waitForParticipants(t, bob, "alice", "carol")
++		waitForParticipants(t, carol, "alice", "bob")
++	})
++
++	t.Run("media is relayed across nodes", func(t *testing.T) {
++		audio, err := alice.AddStaticTrack(webrtc.MimeTypeOpus, "audio", "alice-audio")
++		require.NoError(t, err)
++		defer audio.Stop()
++		video, err := alice.AddStaticTrack(webrtc.MimeTypeVP8, "video", "alice-video")
++		require.NoError(t, err)
++		defer video.Stop()
++
++		for _, sub := range []*testclient.RTCClient{bob, carol} {
++			testutils.WithTimeout(t, func() string {
++				tracks := sub.SubscribedTracks()[alice.ID()]
++				if len(tracks) != 2 {
++					return fmt.Sprintf("expected 2 subscribed tracks of alice, got %d", len(tracks))
++				}
++				return ""
++			}, 20*time.Second)
++		}
++		for _, sub := range []*testclient.RTCClient{bob, carol} {
++			before := sub.BytesReceived()
++			testutils.WithTimeout(t, func() string {
++				if received := sub.BytesReceived(); received <= before {
++					return fmt.Sprintf("no media received yet (%d bytes)", received)
++				}
++				return ""
++			}, 10*time.Second)
++		}
++	})
++
++	t.Run("media is relayed in both directions", func(t *testing.T) {
++		// node pairs now relay in both directions (alice -> bob and bob -> alice)
++		audio, err := bob.AddStaticTrack(webrtc.MimeTypeOpus, "audio", "bob-audio")
++		require.NoError(t, err)
++		defer audio.Stop()
++
++		for _, sub := range []*testclient.RTCClient{alice, carol} {
++			testutils.WithTimeout(t, func() string {
++				if n := len(sub.SubscribedTracks()[bob.ID()]); n != 1 {
++					return fmt.Sprintf("expected 1 subscribed track of bob, got %d", n)
++				}
++				return ""
++			}, 20*time.Second)
++		}
++		// alice publishes only, everything she receives comes from bob
++		before := alice.BytesReceived()
++		testutils.WithTimeout(t, func() string {
++			if received := alice.BytesReceived(); received <= before {
++				return fmt.Sprintf("alice received no media from bob yet (%d bytes)", received)
++			}
++			return ""
++		}, 10*time.Second)
++	})
++
++	t.Run("data packets are relayed across nodes", func(t *testing.T) {
++		var lock sync.Mutex
++		received := map[string]string{}
++		for name, sub := range map[string]*testclient.RTCClient{"alice": alice, "carol": carol} {
++			sub.SetOnDataReceived(func(data []byte, sid string) {
++				lock.Lock()
++				received[name] = string(data)
++				lock.Unlock()
++			})
++		}
++		testutils.WithTimeout(t, func() string {
++			// data channels might still be opening, keep sending
++			_ = bob.PublishData([]byte("hello from bob"), livekit.DataPacket_RELIABLE)
++			lock.Lock()
++			defer lock.Unlock()
++			for _, name := range []string{"alice", "carol"} {
++				if received[name] != "hello from bob" {
++					return name + " did not receive data"
++				}
++			}
++			return ""
++		}, 15*time.Second)
++	})
++
++	t.Run("leaving participant is removed on all nodes", func(t *testing.T) {
++		carol.Stop()
++		for _, c := range []*testclient.RTCClient{alice, bob} {
++			testutils.WithTimeout(t, func() string {
++				for _, id := range identities(c.RemoteParticipants()) {
++					if id == "carol" {
++						return "carol still visible"
++					}
++				}
++				return ""
++			}, 15*time.Second)
++		}
++	})
++}
++
++// TestNodeFailure stops (kills) the node hosting a participant and verifies
++// that the room continues on the other nodes and the participant can rejoin.
++//
++// Requires
++//   - LIVEKIT_REDIS_ADDR: Redis of the cluster
++//   - LIVEKIT_NODE_RELAY_ADDRS: relay address (ip:port) of the nodes, in the order of LIVEKIT_NODE_URLS
++//   - LIVEKIT_STOP_NODE_CMD: shell command, {node} is replaced by the relay address of the node to stop
++func TestNodeFailure(t *testing.T) {
++	c := getCluster(t)
++	stopCmd := os.Getenv("LIVEKIT_STOP_NODE_CMD")
++	relayAddrs := strings.Split(os.Getenv("LIVEKIT_NODE_RELAY_ADDRS"), ",")
++	if stopCmd == "" || len(relayAddrs) != len(c.urls) {
++		t.Skip("set LIVEKIT_STOP_NODE_CMD and LIVEKIT_NODE_RELAY_ADDRS to run the node failure test")
++	}
++	rc := redis.NewClient(&redis.Options{Addr: getenv("LIVEKIT_REDIS_ADDR", "localhost:6379")})
++	defer rc.Close()
++	ctx := context.Background()
++
++	room := "dist-failover-" + guid.New("")
++	names := []string{"alice", "bob", "carol"}
++	clients := map[string]*testclient.RTCClient{}
++	signalIdx := map[string]int{}
++	for i, name := range names {
++		clients[name] = c.join(t, room, name, i)
++		signalIdx[name] = i
++	}
++	waitForParticipants(t, clients["alice"], "bob", "carol")
++
++	// which node (index of LIVEKIT_NODE_URLS) hosts which participant
++	nodeIdx := map[string]int{}
++	for _, name := range names {
++		nodeID, err := rc.HGet(ctx, "dist:participant_node:"+room, name).Result()
++		require.NoError(t, err)
++		addr, err := rc.HGet(ctx, "dist:node_relay", nodeID).Result()
++		require.NoError(t, err)
++		idx := slices.Index(relayAddrs, addr)
++		require.GreaterOrEqual(t, idx, 0, "unknown relay address %s", addr)
++		nodeIdx[name] = idx
++	}
++	victim := "carol"
++	failed := nodeIdx[victim]
++	for _, name := range names {
++		if name != victim {
++			require.NotEqual(t, failed, nodeIdx[name], "%s shares the node of %s, check max_participants_per_node: 1", name, victim)
++		}
++	}
++
++	// the observer's session survives: neither its signal nor its RTC node fails
++	var observer, other string
++	for _, name := range names {
++		if name == victim {
++			continue
++		}
++		if observer == "" && signalIdx[name] != failed {
++			observer = name
++		} else {
++			other = name
++		}
++	}
++	require.NotEmpty(t, observer)
++	t.Logf("victim %s on node %d, observer %s, other %s", victim, failed, observer, other)
++
++	audio, err := clients[observer].AddStaticTrack(webrtc.MimeTypeOpus, "audio", observer+"-audio")
++	require.NoError(t, err)
++	defer audio.Stop()
++
++	cmd := strings.ReplaceAll(stopCmd, "{node}", relayAddrs[failed])
++	t.Logf("stopping node %d: %s", failed, cmd)
++	out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
++	require.NoError(t, err, string(out))
++	clients[victim].Stop()
++
++	t.Run("participants of the failed node are removed", func(t *testing.T) {
++		testutils.WithTimeout(t, func() string {
++			for _, id := range identities(clients[observer].RemoteParticipants()) {
++				if id == victim {
++					return victim + " still visible to " + observer
++				}
++			}
++			return ""
++		}, 30*time.Second)
++
++		testutils.WithTimeout(t, func() string {
++			ids, err := c.listParticipants(room, signalIdx[observer])
++			if err != nil {
++				return err.Error()
++			}
++			if slices.Contains(ids, victim) {
++				return fmt.Sprintf("%s still listed by RoomService: %v", victim, ids)
++			}
++			return ""
++		}, 30*time.Second)
++	})
++
++	t.Run("participant rejoins on a live node", func(t *testing.T) {
++		// free a slot on a live node (max_participants_per_node: 1)
++		clients[other].Stop()
++
++		var rejoined *testclient.RTCClient
++		testutils.WithTimeout(t, func() string {
++			cl, ok := c.tryJoin(t, room, victim, signalIdx[observer])
++			if !ok {
++				return victim + " could not rejoin yet"
++			}
++			rejoined = cl
++			return ""
++		}, 40*time.Second)
++
++		waitForParticipants(t, rejoined, observer)
++		waitForParticipants(t, clients[observer], victim)
++		testutils.WithTimeout(t, func() string {
++			if len(rejoined.SubscribedTracks()[clients[observer].ID()]) != 1 {
++				return victim + " is not subscribed to the audio of " + observer
++			}
++			return ""
++		}, 20*time.Second)
++
++		nodeID, err := rc.HGet(ctx, "dist:participant_node:"+room, victim).Result()
++		require.NoError(t, err)
++		addr, err := rc.HGet(ctx, "dist:node_relay", nodeID).Result()
++		require.NoError(t, err)
++		require.NotEqual(t, relayAddrs[failed], addr)
++	})
++}
++
++func (c *cluster) listParticipants(room string, idx int) ([]string, error) {
++	at := auth.NewAccessToken(c.apiKey, c.apiSecret)
++	at.SetVideoGrant(&auth.VideoGrant{RoomAdmin: true, Room: room})
++	token, err := at.ToJWT()
++	if err != nil {
++		return nil, err
++	}
++	header := make(http.Header)
++	testclient.SetAuthorizationToken(header, token)
++	ctx, err := twirp.WithHTTPRequestHeaders(context.Background(), header)
++	if err != nil {
++		return nil, err
++	}
++	httpURL := strings.Replace(c.urls[idx], "ws", "http", 1)
++	res, err := livekit.NewRoomServiceProtobufClient(httpURL, &http.Client{Timeout: 5 * time.Second}).
++		ListParticipants(ctx, &livekit.ListParticipantsRequest{Room: room})
++	if err != nil {
++		return nil, err
++	}
++	return identities(res.Participants), nil
++}
++
++// tryJoin is like join, but returns false when the node at urls[idx] is not reachable.
++func (c *cluster) tryJoin(t *testing.T, room string, identity string, idx int) (*testclient.RTCClient, bool) {
++	at := auth.NewAccessToken(c.apiKey, c.apiSecret).SetIdentity(identity).SetName(identity)
++	at.SetVideoGrant(&auth.VideoGrant{RoomJoin: true, Room: room})
++	token, err := at.ToJWT()
++	require.NoError(t, err)
++
++	opts := clientOptions()
++	ws, err := testclient.NewWebSocketConn(c.urls[idx], token, opts)
++	if err != nil {
++		return nil, false
++	}
++	client, err := testclient.NewRTCClient(ws, opts.UseJoinRequestQueryParam, opts)
++	if err != nil {
++		return nil, false
++	}
++	go func() { _ = client.Run() }()
++	if err := client.WaitUntilConnected(10 * time.Second); err != nil {
++		client.Stop()
++		return nil, false
++	}
++	t.Cleanup(client.Stop)
++	return client, true
++}
+diff --git a/test/distributed/run-tests.sh b/test/distributed/run-tests.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..1e8c82b291012ac399a68921c9d0f641448558fe
+--- /dev/null
++++ b/test/distributed/run-tests.sh
+@@ -0,0 +1,224 @@
++#!/usr/bin/env bash
++# End-to-end tests of distributed rooms on a local 3 node cluster.
++#
++#   ./run-tests.sh            all scenarios
++#   ./run-tests.sh go         Go e2e tests (needs Go on the host)
++#   ./run-tests.sh loadtest   lk load-test across nodes
++#   ./run-tests.sh failover   node failure with lk
++#
++# Exit code 0 when all selected scenarios pass. Set KEEP=1 to keep the
++# cluster running afterwards.
++set -uo pipefail
++cd "$(dirname "$0")"
++export BUILDKIT_PROGRESS=plain
++
++API_KEY=devkey
++API_SECRET=secretsecretsecretsecretsecretsecret
++URLS=(ws://localhost:7880 ws://localhost:7980 ws://localhost:8080)
++SERVICES=(livekit-1 livekit-2 livekit-3)
++RELAY_ADDRS=(172.28.0.11:7890 172.28.0.12:7890 172.28.0.13:7890)
++
++SCENARIOS=("$@")
++[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(go loadtest failover)
++
++RESULTS=()
++FAILED=0
++
++log()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
++pass() { RESULTS+=("PASS  $*"); printf '\033[32mPASS\033[0m %s\n' "$*"; }
++fail() { RESULTS+=("FAIL  $*"); printf '\033[31mFAIL\033[0m %s\n' "$*"; FAILED=1; }
++
++lk() { docker compose run --rm -T lk "$@"; }
++redis() { docker compose exec -T redis redis-cli "$@"; }
++
++# relay address of a node id
++node_relay() { redis HGET dist:node_relay "$1" | tr -d '\r'; }
++# participants per node of a room, e.g. "livekit-1: 4"
++print_distribution() {
++  echo "participants per node in $1:"
++  for nodeID in $(redis HVALS "dist:participant_node:$1" | tr -d '\r' | sort | uniq); do
++    local n; n=$(redis HVALS "dist:participant_node:$1" | tr -d '\r' | grep -cx "$nodeID")
++    echo "  $(node_service "$nodeID") ($nodeID): $n"
++  done
++}
++
++# service name of a node id
++node_service() {
++  local addr; addr=$(node_relay "$1")
++  for i in "${!RELAY_ADDRS[@]}"; do
++    [ "${RELAY_ADDRS[$i]}" = "$addr" ] && { echo "${SERVICES[$i]}"; return; }
++  done
++}
++
++wait_ready() {
++  for url in "${URLS[@]}"; do
++    local http=${url/ws:/http:}
++    for _ in $(seq 1 60); do
++      curl -fs "$http" >/dev/null 2>&1 && break
++      sleep 1
++    done
++    curl -fs "$http" >/dev/null 2>&1 || { echo "node $http not ready"; docker compose logs --tail 50; exit 1; }
++  done
++  # nodes register their stats in redis every few seconds
++  sleep 3
++}
++
++cluster_up() {
++  log "starting cluster (max_participants_per_node=$1)"
++  # plain progress: BuildKit fails with "failed to get console" when output is not a terminal
++  if ! MAX_PER_NODE=$1 BUILDKIT_PROGRESS=plain docker compose up -d --build --force-recreate \
++       redis "${SERVICES[@]}" > /tmp/lk-dist-compose.log 2>&1; then
++    tail -n 40 /tmp/lk-dist-compose.log
++    echo "starting the cluster failed, full output: /tmp/lk-dist-compose.log"
++    exit 1
++  fi
++  wait_ready
++}
++
++# ------------------------------------------------------------------------------
++
++scenario_go() {
++  if ! command -v go >/dev/null; then
++    echo "go not found on the host, skipping Go e2e tests"
++    RESULTS+=("SKIP  go e2e (no Go toolchain)")
++    return
++  fi
++  cluster_up 1
++  log "Go e2e tests (participants spread, media, data, leave, node failure)"
++  if (cd ../.. && LIVEKIT_DISTRIBUTED_E2E=1 \
++      LIVEKIT_NODE_URLS=$(IFS=,; echo "${URLS[*]}") \
++      LIVEKIT_NODE_RELAY_ADDRS=$(IFS=,; echo "${RELAY_ADDRS[*]}") \
++      LIVEKIT_REDIS_ADDR=localhost:6379 \
++      LIVEKIT_API_KEY=$API_KEY LIVEKIT_API_SECRET=$API_SECRET \
++      LIVEKIT_STOP_NODE_CMD="$PWD/test/distributed/stop-node.sh {node}" \
++      go test ./test/distributed/ -count=1 -v 2>&1 | tee /tmp/lk-dist-go.log | grep -E '^\s*(--- |ok|FAIL|e2e_test.go)'); then
++    grep -q '^ok' /tmp/lk-dist-go.log && pass "go e2e" || fail "go e2e (see /tmp/lk-dist-go.log)"
++  else
++    fail "go e2e (see /tmp/lk-dist-go.log)"
++  fi
++}
++
++scenario_loadtest() {
++  cluster_up 4
++  local room=loadtest-$RANDOM
++  log "lk load-test in room $room: 3 video + 3 audio publishers (simulcast), 6 subscribers"
++  lk load-test --url "${URLS[0]}" --api-key $API_KEY --api-secret $API_SECRET \
++     --room "$room" --video-publishers 3 --audio-publishers 3 --subscribers 6 \
++     --duration 40s > /tmp/lk-dist-loadtest.log 2>&1 &
++  local lkpid=$!
++
++  sleep 25
++  # participants are spread over multiple nodes
++  local nodes
++  nodes=$(redis HVALS "dist:participant_node:$room" | tr -d '\r' | sort -u | grep -c . || true)
++  local participants
++  participants=$(redis HLEN "dist:participant_node:$room" | tr -d '\r')
++  echo "participants: $participants on $nodes nodes"
++  [ "${nodes:-0}" -ge 2 ] && pass "loadtest: participants spread over $nodes nodes" \
++                          || fail "loadtest: participants on $nodes node(s), expected >= 2"
++
++  wait $lkpid; local rc=$?
++  tail -n 30 /tmp/lk-dist-loadtest.log
++  [ $rc -eq 0 ] && pass "loadtest: lk load-test exit code 0" || fail "loadtest: lk load-test exit code $rc"
++
++  # summary "<subscribed>/<expected>" tracks, if lk prints it
++  local summary
++  summary=$(grep -iE 'summary|total' /tmp/lk-dist-loadtest.log | grep -oE '[0-9]+/[0-9]+' | head -1)
++  if [ -n "$summary" ]; then
++    [ "${summary%/*}" = "${summary#*/}" ] && pass "loadtest: all tracks subscribed ($summary)" \
++                                          || fail "loadtest: tracks subscribed $summary"
++  else
++    echo "could not find a track summary in the lk output, relying on server side checks"
++  fi
++
++  # media was relayed between nodes, with all simulcast layers of the video tracks
++  local logs; logs=$(docker compose logs "${SERVICES[@]}" 2>/dev/null)
++  local relayed received failed
++  relayed=$(grep "relaying track to remote node" <<<"$logs" | grep -c "$room")
++  received=$(grep "relayed track received" <<<"$logs" | grep -c "$room")
++  failed=$(grep -E "could not add relayed receiver|could not relay receiver" <<<"$logs" | grep -c "$room")
++  echo "relayed tracks: $relayed, relayed streams received: $received, errors: $failed"
++  [ "$relayed" -gt 0 ] && pass "loadtest: tracks relayed between nodes ($relayed)" || fail "loadtest: no track relayed"
++  [ "$failed" -eq 0 ] && pass "loadtest: no relay errors" || fail "loadtest: $failed relay errors"
++}
++
++scenario_failover() {
++  cluster_up 4
++  local room=failover-$RANDOM
++  log "failover in room $room"
++  # capacity: 3 nodes x 4 = 12 slots, 2 x 4 = 8 after the failure. At most 6 load
++  # test participants, so that after they reconnected there is still room for
++  # the additional participant joining after the failure.
++  lk load-test --url "${URLS[0]}" --api-key $API_KEY --api-secret $API_SECRET \
++     --room "$room" --video-publishers 1 --audio-publishers 1 --subscribers 4 \
++     --duration 90s > /tmp/lk-dist-failover.log 2>&1 &
++  local lkpid=$!
++  sleep 20
++
++  print_distribution "$room"
++
++  # kill a node hosting participants, but not the node the load tester signals through
++  local victim="" victim_svc=""
++  for nodeID in $(redis HVALS "dist:participant_node:$room" | tr -d '\r' | sort -u); do
++    local svc; svc=$(node_service "$nodeID")
++    if [ -n "$svc" ] && [ "$svc" != "${SERVICES[0]}" ]; then victim=$nodeID; victim_svc=$svc; break; fi
++  done
++  if [ -z "$victim" ]; then
++    fail "failover: no participants on livekit-2/livekit-3, cannot test"
++    kill $lkpid 2>/dev/null; return
++  fi
++  echo "killing $victim_svc ($victim)"
++  docker compose kill -s SIGKILL "$victim_svc" >/dev/null
++
++  sleep 15
++  # the failed node is removed from the room
++  if redis HKEYS "dist:room_nodes:$room" | tr -d '\r' | grep -qx "$victim"; then
++    fail "failover: failed node still registered for the room"
++  else
++    pass "failover: failed node removed from the room"
++  fi
++  # no participant is listed that was hosted on the failed node
++  local listed stale=0
++  listed=$(lk room participants list "$room" 2>/dev/null)
++  echo "$listed" | head -20
++  for identity in $(redis HKEYS "dist:participant_node:$room" | tr -d '\r'); do
++    [ "$(redis HGET "dist:participant_node:$room" "$identity" | tr -d '\r')" = "$victim" ] && stale=$((stale+1))
++  done
++  [ $stale -eq 0 ] && pass "failover: no participant assigned to the failed node" \
++                   || fail "failover: $stale participants still assigned to the failed node"
++  [ -n "$listed" ] && pass "failover: room still alive on the remaining nodes" || fail "failover: room not listed"
++
++  print_distribution "$room"
++
++  # a new participant joins on a live node
++  timeout 20 docker compose run --rm -T lk room join --identity rejoiner --publish-demo "$room" > /tmp/lk-dist-rejoin.log 2>&1 &
++  sleep 12
++  local node; node=$(redis HGET "dist:participant_node:$room" rejoiner | tr -d '\r')
++  if [ -n "$node" ] && [ "$node" != "$victim" ]; then
++    pass "failover: new participant placed on live node $(node_service "$node")"
++  else
++    fail "failover: new participant not placed on a live node (node: '${node}')"
++    print_distribution "$room"
++    grep -E "ERROR|response|could not" /tmp/lk-dist-rejoin.log | head -5
++  fi
++  wait
++
++  log "restarting $victim_svc"
++  docker compose start "$victim_svc" >/dev/null 2>&1
++}
++
++# ------------------------------------------------------------------------------
++
++for s in "${SCENARIOS[@]}"; do
++  case "$s" in
++    go) scenario_go ;;
++    loadtest) scenario_loadtest ;;
++    failover) scenario_failover ;;
++    *) echo "unknown scenario $s"; exit 2 ;;
++  esac
++done
++
++log "results"
++printf '%s\n' "${RESULTS[@]}"
++[ "${KEEP:-0}" = "1" ] || docker compose down >/dev/null 2>&1
++exit $FAILED
+diff --git a/test/distributed/stop-node.sh b/test/distributed/stop-node.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..daf3d089a1cf0666b25d4576d82c883a629d88b3
+--- /dev/null
++++ b/test/distributed/stop-node.sh
+@@ -0,0 +1,14 @@
++#!/usr/bin/env bash
++# Kills the LiveKit node with the given relay address (ip:port), used by the
++# node failure test (LIVEKIT_STOP_NODE_CMD="./stop-node.sh {node}").
++set -euo pipefail
++cd "$(dirname "$0")"
++ip="${1%%:*}"
++case "$ip" in
++  172.28.0.11) svc=livekit-1 ;;
++  172.28.0.12) svc=livekit-2 ;;
++  172.28.0.13) svc=livekit-3 ;;
++  *) echo "unknown node $1" >&2; exit 1 ;;
++esac
++echo "killing $svc ($1)"
++docker compose kill -s SIGKILL "$svc" >/dev/null
+diff --git a/test/distributed/web/index.html b/test/distributed/web/index.html
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f7d04c1692bde14b76d1bd82638c4ff7fbf283c
+--- /dev/null
++++ b/test/distributed/web/index.html
+@@ -0,0 +1,103 @@
++<!doctype html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>Distributed Room Test</title>
++<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.5.0/dist/livekit-client.umd.min.js"></script>
++<style>
++  :root { --bg: #f6f7f9; --fg: #1d2330; --muted: #6a7282; --card: #fff; --border: #d9dde4; --accent: #2f6fde; }
++  @media (prefers-color-scheme: dark) {
++    :root { --bg: #14171c; --fg: #e6e9ef; --muted: #98a0ad; --card: #1d2128; --border: #313743; --accent: #6c9cf0; }
++  }
++  body { margin: 0; padding: 16px; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
++  h1 { font-size: 18px; margin: 0 0 12px; }
++  form { display: grid; gap: 8px; max-width: 720px; }
++  label { color: var(--muted); font-size: 12px; }
++  select, textarea, button { font: inherit; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--fg); }
++  textarea { height: 60px; width: 100%; box-sizing: border-box; }
++  button { background: var(--accent); color: #fff; border: none; cursor: pointer; }
++  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
++  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; margin-top: 16px; }
++  .tile { background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
++  .tile video { width: 100%; aspect-ratio: 16/9; background: #000; display: block; }
++  .tile .name { padding: 4px 8px; font-size: 12px; }
++  .tile.speaking { outline: 2px solid var(--accent); }
++  #log { margin-top: 16px; font: 12px/1.4 ui-monospace, monospace; color: var(--muted); white-space: pre-wrap; max-height: 200px; overflow: auto; }
++</style>
++</head>
++<body>
++<h1>Distributed room test</h1>
++<form id="f">
++  <div>
++    <label for="url">Signal node</label><br>
++    <select id="url">
++      <option value="ws://localhost:7880">livekit-1 (ws://localhost:7880)</option>
++      <option value="ws://localhost:7980">livekit-2 (ws://localhost:7980)</option>
++      <option value="ws://localhost:8080">livekit-3 (ws://localhost:8080)</option>
++    </select>
++  </div>
++  <div>
++    <label for="token">Token (see README: lk token create)</label>
++    <textarea id="token"></textarea>
++  </div>
++  <div class="row">
++    <label><input type="checkbox" id="cam" checked> camera</label>
++    <label><input type="checkbox" id="mic" checked> microphone</label>
++    <button type="submit" id="connect">Connect</button>
++    <button type="button" id="leave">Leave</button>
++  </div>
++</form>
++<div id="grid"></div>
++<div id="log"></div>
++<script>
++const LK = LivekitClient;
++let room;
++const $ = (id) => document.getElementById(id);
++const log = (msg) => { $('log').textContent = new Date().toLocaleTimeString() + ' ' + msg + '\n' + $('log').textContent; };
++
++function tile(p) {
++  let el = document.querySelector(`[data-p="${p.identity}"]`);
++  if (!el) {
++    el = document.createElement('div');
++    el.className = 'tile';
++    el.dataset.p = p.identity;
++    el.innerHTML = '<video autoplay playsinline muted></video><div class="name"></div>';
++    $('grid').appendChild(el);
++  }
++  el.querySelector('.name').textContent = p.identity + (p instanceof LK.LocalParticipant ? ' (you)' : '');
++  return el;
++}
++
++$('f').onsubmit = async (e) => {
++  e.preventDefault();
++  room = new LK.Room({ adaptiveStream: true, dynacast: true });
++  room
++    .on(LK.RoomEvent.ParticipantConnected, (p) => { tile(p); log('joined: ' + p.identity); })
++    .on(LK.RoomEvent.ParticipantDisconnected, (p) => { tile(p).remove(); log('left: ' + p.identity); })
++    .on(LK.RoomEvent.TrackSubscribed, (track, pub, p) => {
++      log(`subscribed ${track.kind} of ${p.identity}`);
++      if (track.kind === 'video') track.attach(tile(p).querySelector('video'));
++      else document.body.appendChild(track.attach());
++    })
++    .on(LK.RoomEvent.TrackUnsubscribed, (track) => track.detach().forEach((el) => el.tagName === 'AUDIO' && el.remove()))
++    .on(LK.RoomEvent.ActiveSpeakersChanged, (speakers) => {
++      document.querySelectorAll('.tile').forEach((t) => t.classList.toggle('speaking', speakers.some((s) => s.identity === t.dataset.p)));
++    })
++    .on(LK.RoomEvent.DataReceived, (data, p) => log(`data from ${p?.identity}: ${new TextDecoder().decode(data)}`))
++    .on(LK.RoomEvent.Disconnected, () => log('disconnected'));
++
++  await room.connect($('url').value, $('token').value.trim());
++  log(`connected to ${room.name} via ${$('url').value} as ${room.localParticipant.identity}`);
++  room.remoteParticipants.forEach((p) => tile(p));
++  const lp = tile(room.localParticipant);
++  if ($('cam').checked) {
++    const pub = await room.localParticipant.setCameraEnabled(true);
++    pub?.videoTrack?.attach(lp.querySelector('video'));
++  }
++  if ($('mic').checked) await room.localParticipant.setMicrophoneEnabled(true);
++};
++$('leave').onclick = () => { room?.disconnect(); $('grid').innerHTML = ''; };
++</script>
++</body>
++</html>

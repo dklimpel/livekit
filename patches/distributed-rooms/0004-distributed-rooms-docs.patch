@@ -1,0 +1,641 @@
+diff --git a/docs/distributed-rooms/README.md b/docs/distributed-rooms/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..a80e9cc7e837a4afb3be2c18106040565a0c373c
+--- /dev/null
++++ b/docs/distributed-rooms/README.md
+@@ -0,0 +1,58 @@
++# Verteilte Räume (Distributed Rooms)
++
++Upstream-LiveKit hostet einen Raum immer auf genau **einem** Node. Die maximale
++Raumgröße ist dadurch durch die Hardware einer Maschine begrenzt.
++
++Diese Erweiterung verteilt einen Raum auf **mehrere Nodes**. Jeder Node hostet einen
++Teil der Teilnehmer. Teilnehmer und Tracks der anderen Nodes werden lokal
++gespiegelt, Medien werden bei Bedarf über eine WebRTC-Verbindung zwischen den Nodes
++weitergeleitet (Relay). Für Clients bzw. SDKs ändert sich nichts.
++
++Die Erweiterung wird als **Patch-Serie** auf ein Upstream-Release-Tag angewendet, ein
++Fork muss nicht gepflegt werden. Ohne `distributed.enabled: true` verhält sich der
++Server exakt wie Upstream.
++
++| Dokument | Inhalt |
++|---|---|
++| [architektur.md](architektur.md) | Aufbau, Datenflüsse, Komponenten, Redis-Schlüssel |
++| [konfiguration.md](konfiguration.md) | Konfigurationsoptionen, Ports, Netzwerk |
++| [betrieb.md](betrieb.md) | Platzierung, Ausfallverhalten, Monitoring, Einschränkungen |
++| [patch-workflow.md](patch-workflow.md) | Patch anwenden, auf neue Upstream-Releases heben, pflegen |
++| [tests.md](tests.md) | Unit-Tests, Docker-Compose-Testsetup, lk CLI, Browser-Test |
++
++## Funktionsumfang
++
++| Funktion | Status |
++|---|---|
++| Teilnehmer eines Raums auf mehreren Nodes (Auffüllen, dann Überlaufen) | ✅ |
++| Teilnehmerliste, Metadaten, Attribute, Berechtigungen nodeübergreifend | ✅ |
++| Audio/Video-Relay zwischen Nodes, nur bei Bedarf | ✅ |
++| Simulcast (alle Layer werden weitergeleitet, Layer-Auswahl pro Node) | ✅ |
++| Dynacast (Qualitätswünsche entfernter Nodes erreichen den Publisher) | ✅ |
++| NACK, PLI/Keyframe-Anforderung, Sender Reports (A/V-Sync) über das Relay | ✅ |
++| Data Packets inkl. RPC, Chat, Text-/Byte-Streams | ✅ |
++| Active Speaker nodeübergreifend | ✅ |
++| Raum-Metadaten, Raum löschen (API) auf allen Nodes | ✅ |
++| Node-Ausfall: Raum läuft weiter, Teilnehmer verbinden sich neu | ✅ |
++| RoomService-API (List/Get/Update/Remove/Mute/SendData) | ✅ |
++| Webhooks `room_started`/`room_finished` nur einmal pro Raum | ✅ |
++| Egress, Agents, SIP im verteilten Raum | ⚠️ siehe [betrieb.md](betrieb.md#einschränkungen) |
++| Data Tracks, unlabeled Data Messages, Connection-Quality entfernter Teilnehmer | ❌ noch nicht |
++
++## Schnellstart
++
++```bash
++# Patches auf ein Upstream-Release anwenden und bauen
++patches/distributed-rooms/apply.sh v1.13.11 /tmp/livekit-dist
++
++# lokales Test-Cluster (Redis + 3 Nodes) und alle Szenarien
++cd /tmp/livekit-dist/test/distributed && ./run-tests.sh
++```
++
++Minimale Konfiguration (zusätzlich zu Redis):
++
++```yaml
++distributed:
++  enabled: true
++  max_participants_per_node: 200
++```
+diff --git a/docs/distributed-rooms/architektur.md b/docs/distributed-rooms/architektur.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..80892b5cb4743d0b94b91d11fea253011bbe3eda
+--- /dev/null
++++ b/docs/distributed-rooms/architektur.md
+@@ -0,0 +1,147 @@
++# Architektur
++
++## Überblick
++
++```
++                 ┌──────────────── Redis ────────────────┐
++                 │ Node-Registry, Raum→Nodes,             │
++                 │ Teilnehmer→Node, Pub/Sub-Kanäle        │
++                 └───────▲───────────────▲───────────────┘
++                         │               │
++        ┌────────────────┴──┐         ┌──┴────────────────┐
++        │ Node A            │  WebRTC │ Node B            │
++        │ rtc.Room "demo"   │◄───────►│ rtc.Room "demo"   │
++        │  alice (lokal)    │  Relay  │  bob (lokal)      │
++        │  bob   (remote)   │         │  alice (remote)   │
++        └───────▲───────────┘         └───────▲───────────┘
++                │                             │
++             Client alice                  Client bob
++```
++
++Jeder Node, der Teilnehmer eines Raums hostet, betreibt eine normale `rtc.Room`-Instanz
++mit seinen **lokalen** Teilnehmern. Teilnehmer der anderen Nodes werden als
++`RemoteParticipant` in diesen Raum gespiegelt. Für lokale Teilnehmer sehen sie aus wie
++normale Teilnehmer: Sie erscheinen im Join-Response, in Participant-Updates, Active
++Speakers usw.
++
++Tracks entfernter Teilnehmer sind normale `rtc.MediaTrack`-Objekte (`remoteTrack`).
++Statt von einem Client werden ihre Receiver vom Relay gespeist. Dadurch funktionieren
++Downtracks, Simulcast-Layer-Auswahl, Dynacast, Pacing und Congestion Control zu den
++Subscribern unverändert.
++
++## Komponenten (`pkg/distributed`)
++
++| Datei | Aufgabe |
++|---|---|
++| `manager.go` | Einstiegspunkt pro Node. Wird vom `RoomManager` erzeugt, verwaltet die verteilten Räume des Nodes, empfängt Relay-Nachrichten. Alle Methoden sind auf `nil` sicher (Feature aus). |
++| `placement.go` | Entscheidet, auf welchem Node ein Teilnehmer gehostet wird („Auffüllen, dann Überlaufen“). |
++| `store.go` | Cluster-Zustand in Redis (Raum→Nodes, Teilnehmer→Node, Locks). |
++| `roomstate.go` | Verteilter Teil eines Raums auf einem Node: Abgleich der Teilnehmer, Data Packets, Sprecher, Metadaten, Raum schließen. |
++| `remoteparticipant.go` | Spiegel eines Teilnehmers eines anderen Nodes (`types.Participant`). |
++| `remotetrack.go` | Track eines anderen Nodes, fordert das Relay bei der ersten Subscription an. |
++| `relayconn.go` | Relay zu einem Peer-Node für einen Raum, empfangende Seite. |
++| `relaysender.go` | Relay zu einem Peer-Node für einen Raum, sendende Seite, inkl. `relayDownTrack`. |
++| `relaytransport.go` | Gemeinsamer UDP-Port und PeerConnection-Fabrik für Relays. |
++| `nodecheck.go` | Erkennt ausgefallene Nodes eines Raums. |
++| `messages.go` | Nachrichtenformat zwischen den Nodes. |
++
++Einhängepunkte in Upstream-Code (bewusst klein gehalten, siehe [patch-workflow.md](patch-workflow.md)):
++
++| Datei | Änderung |
++|---|---|
++| `pkg/config/config.go` | Feld `Distributed` (Typ in neuer Datei `config/distributed.go`) |
++| `pkg/routing/redisrouter.go` | optionaler `ParticipantPlacer` (neue Datei `routing/distributed_hook.go`) |
++| `pkg/service/signal.go` | Session-Annahme ohne „Raum gehört diesem Node“-Prüfung |
++| `pkg/service/roomallocator.go` | kein Abweisen bei vollem Node (Überlauf statt Fehler) |
++| `pkg/service/roommanager.go` | Manager erzeugen, Raum an-/abmelden, Telemetrie einmal pro Raum, Teilnehmerliste inkl. Remote |
++| `pkg/rtc/room.go` | Remote-Teilnehmer in Join-Response, Auto-Subscribe, Berechtigungen, Sprecher, Zähler; Data-Packets/Berechtigungen nach außen melden (Logik in neuer Datei `rtc/room_distributed.go`) |
++
++## Ablauf: Teilnehmer verbindet sich
++
++1. Der Client verbindet sich mit einem beliebigen Node (Signal-Node), z. B. über einen Load Balancer.
++2. `RTCService` → `RoomAllocator.SelectRoomNode`. Im verteilten Modus wird der Raum nur
++   dann abgewiesen, wenn **alle** Nodes voll sind.
++3. `RedisRouter.StartParticipantSignal` fragt den `Placer` nach dem Node für **diesen
++   Teilnehmer**:
++   - Ist die Identität bereits einem lebenden Node zugeordnet (Resume, doppelte
++     Identität), bleibt sie dort.
++   - Sonst wird der vollste Node des Raums unterhalb seiner Limits gewählt (Auffüllen).
++   - Sind alle Nodes des Raums voll, wählt der konfigurierte Node-Selector einen
++     weiteren Node aus (Überlaufen).
++   - Die Zuordnung wird in `dist:participant_node:<raum>` gespeichert. Ein Redis-Lock pro
++     Raum serialisiert gleichzeitige Platzierungen.
++4. Die Signalisierung wird wie bei Upstream per psrpc an den gewählten Node weitergeleitet.
++5. Erzeugt der Node den Raum lokal zum ersten Mal, meldet er sich in `dist:room_nodes:<raum>`
++   an, abonniert den Raum-Kanal und fordert per `sync_request` den Zustand der anderen Nodes an.
++
++## Ablauf: Zustandsabgleich
++
++Jeder Node veröffentlicht Änderungen seiner lokalen Teilnehmer auf dem Kanal
++`dist|room|<raum>`:
++
++| Nachricht | Auslöser | Wirkung auf den anderen Nodes |
++|---|---|---|
++| `participant_update` | jede Teilnehmeränderung (Join, Tracks, Mute, Metadaten, Attribute, Berechtigungen, Leave) | Remote-Teilnehmer anlegen/aktualisieren/entfernen, Tracks veröffentlichen/entfernen |
++| `sync_request` | Node tritt dem Raum bei | alle lokalen Teilnehmer erneut senden |
++| `data_packet` | Data Packet eines lokalen Teilnehmers oder der API | an lokale Teilnehmer zustellen (Ziel-Identitäten werden lokal gefiltert) |
++| `speakers` | periodisch (`audio.update_interval`), solange gesprochen wird | Audiopegel der Remote-Teilnehmer, die Sprechererkennung läuft lokal |
++| `room_metadata` | Raum-Metadaten geändert | Metadaten übernehmen |
++| `room_close` | Raum per API gelöscht | Raum lokal schließen |
++| `node_left` | lokaler Raum geschlossen (leer, Shutdown) | Teilnehmer dieses Nodes entfernen |
++
++Die Nachrichten sind JSON-Umschläge (`wrapperspb.BytesValue`) über den vorhandenen
++psrpc-Redis-Bus. LiveKit-Protos darin sind binär kodiert. Eine Änderung an
++`github.com/livekit/protocol` ist dafür nicht nötig.
++
++## Ablauf: Medien-Relay
++
++```
++Node A (Publisher alice)                         Node B (Subscriber bob)
++                                                 bob abonniert alices Track
++                                                 → remoteTrack.AddSubscriber
++                         ◄── relay_subscribe ──
++relaySender.addTrack:
++ pro Codec × Simulcast-Layer ein
++ sendonly-Transceiver + relayDownTrack
++ am lokalen Receiver
++                         ── relay_offer ──────►
++                         ◄── relay_answer ─────   relayConn.handleOffer
++                         ◄─── ICE / DTLS ─────►
++RTP aller Layer ──────────────────────────────►  OnTrack → MediaTrack.AddReceiver
++                                                 (Layer über RID zugeordnet)
++                                                 → normale Downtracks zu bob
++                         ◄── RTCP: NACK, PLI ──   (vom LiveKit-Buffer erzeugt)
++NACK: pion NACK-Responder
++PLI : Receiver.SendPLI → Publisher
++Sender Reports des Publishers ────────────────►  A/V-Sync bleibt erhalten
++                         ◄── relay_quality ────   Dynacast von B
++NotifySubscriberNodeMaxQuality(B, …)
++```
++
++- Pro Raum und Node-Paar gibt es höchstens eine empfangende und eine sendende
++  PeerConnection. Die sendende Seite ist immer der Offerer.
++- Ein Track wird **einmal pro Node** übertragen, egal wie viele Subscriber dort sind.
++- Alle Simulcast-Layer werden weitergeleitet, die Layer-Auswahl pro Subscriber erfolgt
++  auf dem empfangenden Node. Nicht benötigte Layer pausiert der Publisher über Dynacast,
++  sobald kein Node sie mehr anfordert.
++- Header-Extension-IDs werden auf die IDs der Relay-Verbindung umgeschrieben.
++- Jede Relay-Verbindung belegt einen eigenen UDP-Port aus dem Relay-Portbereich
++  (`distributed.relay.port_range_start`–`port_range_end`) und ist DTLS/SRTP-verschlüsselt.
++  Ein gemeinsamer Port für alle Verbindungen funktioniert nicht: Die Verbindungen beider
++  Richtungen zwischen denselben zwei Nodes hätten dasselbe Adresspaar und würden sich
++  gegenseitig stören.
++- Die WebRTC-Logs (pion) des Relays laufen unter der Komponente `transport` und folgen
++  damit `logging.pion_level`, wie die Verbindungen zu den Clients.
++
++## Redis-Schlüssel
++
++| Schlüssel | Typ | Inhalt |
++|---|---|---|
++| `dist:room_nodes:<raum>` | Hash | Node-ID → Unix-Zeit des Beitritts |
++| `dist:participant_node:<raum>` | Hash | Identität → Node-ID |
++| `dist:room_meta:<raum>` | Hash | `agents_node`: Node, der Raum-Agents dispatcht |
++| `dist:placement_lock:<raum>` | String | kurzlebiger Platzierungs-Lock |
++| `dist:node_relay` | Hash | Node-ID → Relay-Adresse `ip:port`. Jeder Node erneuert seinen Eintrag alle 30 s und entfernt Einträge nicht verfügbarer Nodes. |
++| `room_node_map` (Upstream) | Hash | Raum → ein lebender Node des Raums (Kompatibilität) |
++
++Pub/Sub-Kanäle: `dist|room|<raum>` (Zustand), `dist|node|<node-id>` (Relay-Steuerung).
+diff --git a/docs/distributed-rooms/betrieb.md b/docs/distributed-rooms/betrieb.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4711cb43770172ec5aa821e080951bbabce69774
+--- /dev/null
++++ b/docs/distributed-rooms/betrieb.md
+@@ -0,0 +1,91 @@
++# Betrieb
++
++## Platzierung „Auffüllen, dann Überlaufen“
++
++Neue Teilnehmer landen bevorzugt auf dem **vollsten** Node, der den Raum bereits hostet
++und noch nicht voll ist. Erst wenn alle Nodes des Raums voll sind, kommt ein weiterer
++Node hinzu. So bleibt der Relay-Verkehr gering: Kleine Räume bleiben auf einem Node, und
++große Räume verteilen sich auf möglichst wenige Nodes.
++
++Ein Teilnehmer, dessen Identität bereits einem lebenden Node zugeordnet ist, wird immer
++dorthin geleitet. Das betrifft Resume, Reconnect und den Ersatz einer doppelten Identität.
++
++Die Platzierung wird geloggt:
++
++```
++INFO livekit.distributed placed participant {"room": "demo", "participant": "bob",
++     "nodeID": "ND_…", "reason": "overflow", "roomNodes": ["ND_…"], "roomParticipantsOnNode": 1}
++```
++
++`reason`: `new` (erster Node des Raums), `fill`, `overflow`, `assigned` (bestehende Zuordnung).
++
++## Ausfall eines Nodes
++
++1. Ein Node meldet seine Statistiken alle paar Sekunden in Redis. Sind sie älter als
++   5 s, gilt er als nicht verfügbar. Das ist der Upstream-Mechanismus (`selector.AvailableSeconds`).
++2. Die anderen Nodes des Raums prüfen das alle `node_check_interval`. Bei einem
++   ausgefallenen Node entfernen sie seine Teilnehmer und Tracks lokal. Die Clients sehen
++   die Teilnehmer gehen, Subscriptions auf deren Tracks enden. Außerdem löschen sie ihn
++   aus `dist:room_nodes`, aus den Teilnehmer-Zuordnungen und aus dem Room-Store
++   (für `ListParticipants`).
++3. Die Clients des ausgefallenen Nodes verlieren ihre Verbindung. Das SDK versucht
++   zuerst ein Resume. Die Platzierung ignoriert Zuordnungen zu toten Nodes, der
++   Resume-Versuch landet also auf einem lebenden Node, der die Session nicht kennt. Er
++   antwortet mit `Leave(RECONNECT)`, und das SDK verbindet sich vollständig neu.
++4. Der Raum selbst läuft auf den übrigen Nodes ohne Unterbrechung weiter.
++5. Schließt ein Node seinen Teil des Raums, entfernt er dabei auch nicht mehr
++   verfügbare Nodes aus `dist:room_nodes`. So hält ein abgestürzter oder mit neuer
++   Node-ID neu gestarteter Node einen Raum nicht dauerhaft am Leben. Welcher Node der
++   letzte ist und den Raum beendet (Room-Store, `room_finished`), entscheidet Redis
++   atomar, auch wenn mehrere Nodes gleichzeitig schließen.
++
++Typische Erkennungszeit: 5 bis 8 s. Im Testlauf wurde ein beendeter Node nach etwa 4 s
++entfernt.
++
++> Wichtig: Fällt ein Node aus, über den ein Client nur **signalisiert** (Signal-Node ≠
++> RTC-Node), verliert dieser Client ebenfalls seine Verbindung und verbindet sich neu.
++> Das ist Upstream-Verhalten des Signal-Relays.
++
++Geordnetes Herunterfahren (`SIGTERM`/Drain): Der Node nimmt keine neuen Teilnehmer an
++(Status `SHUTTING_DOWN`), schließt seine Räume und meldet `node_left`. Die anderen Nodes
++entfernen seine Teilnehmer sofort.
++
++## Monitoring
++
++Relevante Logmeldungen (Komponente `livekit.distributed` bzw. `livekit.room.distributed`):
++
++| Meldung | Bedeutung |
++|---|---|
++| `distributed rooms enabled` | Feature aktiv (beim Start) |
++| `relay transport` | Relay-Portbereich und IP |
++| `placed participant` | Platzierungsentscheidung |
++| `room attached to distributed room` | Node hostet nun einen Teil des Raums (`numNodes`) |
++| `remote participant joined/left` | Spiegelung von Teilnehmern anderer Nodes |
++| `relaying track to remote node` / `stopped relaying track` | sendende Seite des Relays |
++| `relayed track received` (debug) | empfangene Relay-Streams |
++| `remote node of room is unavailable` | Node-Ausfall erkannt |
++| `relay node ip` | beim Start: verwendete Relay-IP und Quelle (`config`, `LIVEKIT_RELAY_NODE_IP`, `node_ip`) |
++| `relay connection to remote node failed` | Relay-Verbindung kam nicht zustande, enthält beide Relay-Adressen. Fast immer ist der Relay-UDP-Portbereich zwischen den Nodes nicht erreichbar oder die Relay-IP falsch. Neuer Versuch mit wachsender Pause (3 s bis 60 s, `retrying sending relay connection later`). |
++
++Den Zustand eines Raums in Redis prüfen:
++
++```bash
++redis-cli HGETALL dist:room_nodes:demo
++redis-cli HGETALL dist:participant_node:demo
++redis-cli HGETALL dist:node_relay
++```
++
++## Einschränkungen
++
++| Bereich | Verhalten |
++|---|---|
++| Agents | Raum-Agents dispatcht genau ein Node pro Raum. Teilnehmer- und Publisher-Jobs dispatcht der Node des jeweiligen Teilnehmers. Ein Agent ist ein normaler Teilnehmer und kann überall platziert werden. Nicht systematisch getestet. |
++| Egress | Track-/Participant-Egress startet der Node des Publishers. Room-Composite-Egress tritt als Teilnehmer bei und sieht alle Tracks über das Relay. Nicht systematisch getestet. |
++| SIP, Ingress, WHIP | Teilnehmer werden normal platziert. Nicht getestet. |
++| Relay-Lebensdauer | Ein Track bleibt zu einem Node weitergeleitet, bis er unveröffentlicht wird oder der Node den Raum verlässt, auch wenn dort niemand mehr abonniert. Dynacast pausiert dann aber die Video-Layer, sofern sonst niemand sie braucht. |
++| Backup-Codecs | Es werden die Codecs weitergeleitet, die zum Zeitpunkt der ersten Subscription empfangen werden. |
++| Relay-Verbindungsabbruch | Bricht eine Relay-Verbindung ab (ohne Node-Ausfall), wird sie bei der nächsten Anforderung neu aufgebaut. Bereits weitergeleitete Tracks erholen sich dabei nicht in jedem Fall. |
++| Data Tracks, unlabeled Data Messages | Werden nicht zwischen Nodes weitergeleitet. |
++| Connection Quality | Die Verbindungsqualität entfernter Teilnehmer wird nicht übertragen. |
++| Topologie | Voller Mesh zwischen den Nodes eines Raums. Für 5 bis 20 Nodes pro Raum ausgelegt. Bei viel mehr Nodes wäre ein Fan-out-Baum sinnvoll. |
++| Congestion Control Node↔Node | Keine Bandbreitenschätzung auf der Relay-Strecke. Es wird ein gut angebundenes Rechenzentrumsnetz vorausgesetzt. |
+diff --git a/docs/distributed-rooms/konfiguration.md b/docs/distributed-rooms/konfiguration.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..62cf5abe8367367c169154014187fc968bf754bc
+--- /dev/null
++++ b/docs/distributed-rooms/konfiguration.md
+@@ -0,0 +1,106 @@
++# Konfiguration
++
++Verteilte Räume benötigen Redis (`redis.*`), wie jeder Multi-Node-Betrieb von LiveKit.
++
++```yaml
++distributed:
++  # Feature einschalten, Default: false (Upstream-Verhalten)
++  enabled: true
++
++  # Teilnehmer EINES Raums pro Node, bevor weitere Teilnehmer dieses Raums
++  # auf einen anderen Node überlaufen. 0 = nur Node-Limits (siehe unten).
++  max_participants_per_node: 200
++
++  # Node gilt für neue Teilnehmer als voll, wenn seine CPU-Last (0..1) darüber
++  # liegt. 0 = aus.
++  cpu_load_limit: 0.8
++
++  # Prüfintervall für ausgefallene Nodes eines Raums. Default: 2s
++  node_check_interval: 2s
++
++  relay:
++    # UDP-Portbereich der Relay-Verbindungen zu anderen Nodes. Jede Relay-Verbindung
++    # (pro Richtung, Raum und anderem Node) belegt einen eigenen Port.
++    # Default: 7890-8889. (udp_port ist veraltet und wird als port_range_start verwendet.)
++    port_range_start: 7890
++    port_range_end: 8889
++    # IP, unter der andere Nodes diesen Node erreichen.
++    # Reihenfolge: dieser Wert, dann Umgebungsvariable LIVEKIT_RELAY_NODE_IP,
++    # dann die Node-IP (rtc.node_ip bzw. automatisch ermittelt).
++    node_ip: 10.0.0.11
++```
++
++Die beim Start verwendete Relay-IP und ihre Quelle stehen im Log:
++`relay node ip {"ip": "10.42.1.17", "source": "LIVEKIT_RELAY_NODE_IP"}`.
++
++**Größe des Relay-Portbereichs:** Jeder Node braucht pro verteiltem Raum und pro anderem
++Node dieses Raums bis zu zwei Ports (je einen pro Richtung). Beispiel: 50 Räume, die
++jeweils über 5 Nodes verteilt sind, brauchen pro Node bis zu 50 × 4 × 2 = 400 Ports. Ist
++der Bereich erschöpft, kommen weitere Relay-Verbindungen nicht zustande
++(`relay connection to remote node failed`).
++
++Ein Node gilt für neue Teilnehmer eines Raums als **voll**, wenn eine dieser Bedingungen
++zutrifft:
++
++- `max_participants_per_node` ist erreicht. Gezählt werden die Teilnehmer **dieses Raums**
++  auf dem Node.
++- Ein Node-Limit aus `limit.*` ist erreicht (`num_tracks`, `bytes_per_sec`).
++- `cpu_load_limit` ist überschritten.
++
++Neue Nodes für einen Raum wählt der konfigurierte `node_selector` (`kind`, `sort_by`,
++`algorithm`) aus, wie bei Upstream.
++
++## Netzwerk
++
++| Port | Richtung | Zweck |
++|---|---|---|
++| `port` (7880) | Clients → Node | Signalisierung, API |
++| `rtc.tcp_port`/`rtc.udp_port` bzw. Port-Range | Clients → Node | Medien zu Clients (unverändert) |
++| `distributed.relay.port_range_start`–`port_range_end` (7890–8889/udp) | Node ↔ Node | Medien-Relay (WebRTC, DTLS/SRTP) |
++| Redis (6379) | Node → Redis | Zustand, Signal-Relay, Pub/Sub |
++
++- `relay.node_ip` muss von allen anderen Nodes erreichbar sein. Hinter NAT oder in
++  Containern ist das typischerweise die interne IP, nicht die öffentliche `rtc.node_ip`.
++- Die Relay-Verbindung nutzt nur UDP/IPv4 und ICE-Host-Kandidaten, es gibt kein TURN.
++  Die Nodes brauchen also direkte UDP-Erreichbarkeit untereinander.
++- Clients können sich mit **jedem** Node verbinden, z. B. über einen Load Balancer. Der
++  Teilnehmer wird unabhängig davon auf dem passenden Node gehostet; die Signalisierung
++  wird wie bei Upstream per Redis weitergeleitet.
++
++## Kubernetes
++
++Alle Pods verwenden dieselbe Konfiguration (ohne `distributed.relay.node_ip`). Die
++Relay-IP kommt pro Pod über die Downward API:
++
++```yaml
++env:
++  - name: LIVEKIT_RELAY_NODE_IP
++    valueFrom:
++      fieldRef:
++        fieldPath: status.podIP
++```
++
++Für den Relay ist kein `containerPort` und kein Service nötig. Die Nodes verbinden sich
++direkt über die Pod-IPs.
++
++- Die Pods müssen sich gegenseitig auf dem Relay-Portbereich (UDP 7890–8889) erreichen. Bei aktiven
++  NetworkPolicies muss dieser Verkehr zwischen den LiveKit-Pods erlaubt sein. Ein
++  Service für den Relay-Port ist nicht nötig, die Nodes verbinden sich direkt über die
++  Pod-IPs.
++- Mit `hostNetwork: true` ist die Pod-IP die IP des Kubernetes-Nodes. Dann darf nur ein
++  LiveKit-Pod pro Kubernetes-Node laufen, und der Relay-Portbereich muss auf dem Host frei sein.
++- Für die Medien zu den Clients gilt dasselbe wie bei Upstream mit mehreren Nodes: Die
++  von einem Pod angekündigten ICE-Kandidaten (`rtc.node_ip` bzw. die externe IP plus
++  `rtc.tcp_port`/UDP-Ports) müssen **genau diesen Pod** erreichen. Ein Load Balancer, der
++  den RTC-Port auf beliebige Pods verteilt, funktioniert nicht, weil der Teilnehmer nur
++  auf einem bestimmten Pod gehostet wird. Für die Signalisierung (HTTP/WebSocket) ist ein
++  Load Balancer dagegen unproblematisch.
++
++## Hinweise
++
++- Alle Nodes eines Clusters sollten dieselbe `distributed`-Konfiguration verwenden.
++- `room.max_participants` gilt weiterhin für den gesamten Raum und zählt Teilnehmer
++  auf allen Nodes.
++- `room.departure_timeout`/`empty_timeout` gelten pro Node: Ein Node schließt seinen Teil
++  des Raums, wenn er keine lokalen Teilnehmer mehr hat. Der Raum endet erst, wenn der
++  letzte Node ihn schließt.
+diff --git a/docs/distributed-rooms/patch-workflow.md b/docs/distributed-rooms/patch-workflow.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f04d9e2af4ef1b82ece8c82ca4c244abe5fe347e
+--- /dev/null
++++ b/docs/distributed-rooms/patch-workflow.md
+@@ -0,0 +1,103 @@
++# Patch-Workflow
++
++Die Erweiterung wird nicht als Fork gepflegt, sondern als Patch-Serie gegen ein
++Upstream-**Release-Tag**. Die Patches liegen unter `patches/distributed-rooms/`:
++
++| Patch | Inhalt | Konfliktrisiko |
++|---|---|---|
++| `0001-distributed-rooms-upstream-hooks.patch` | Einhängepunkte in 6 Upstream-Dateien (ca. 80 geänderte Zeilen) und 4 neue Dateien in Upstream-Paketen | gering bis mittel, einziger Patch, der Upstream-Code ändert |
++| `0002-distributed-rooms-implementation.patch` | neues Paket `pkg/distributed` | keins (neue Dateien), ggf. API-Anpassungen |
++| `0003-distributed-rooms-tests.patch` | `test/distributed`: E2E-Tests, Docker Compose, Skripte, Testseite | keins |
++| `0004-distributed-rooms-docs.patch` | diese Dokumentation | keins |
++
++`BASE` enthält das Release-Tag, gegen das die Patches erzeugt wurden.
++
++## Patches anwenden
++
++```bash
++patches/distributed-rooms/apply.sh v1.13.11 ./livekit-dist
++```
++
++Das Skript klont `github.com/livekit/livekit` (oder nutzt einen vorhandenen Checkout im
++Zielverzeichnis), legt den Branch `distributed-<tag>` an, wendet die Patches mit
++3-Way-Merge an, baut und führt die Unit-Tests aus. Die Änderungen werden nicht
++committet, damit sie vor dem Commit noch geprüft werden können.
++
++Ohne Skript:
++
++```bash
++git checkout v1.13.11
++git apply --3way patches/distributed-rooms/0*.patch
++go build ./...
++```
++
++Docker-Image bauen, wie bei Upstream:
++
++```bash
++docker build -t livekit-server:v1.13.11-distributed .
++```
++
++## Auf ein neues Upstream-Release heben
++
++1. Patches auf das neue Tag anwenden:
++   ```bash
++   patches/distributed-rooms/apply.sh v1.14.0 ./livekit-v1.14.0
++   ```
++2. Bei einem Konflikt in Patch 0001 die markierten Stellen auflösen (`git status`,
++   `git diff`). Jeder Einhängepunkt ist eine kleine, in sich geschlossene Änderung. Die
++   Tabelle unten beschreibt, was er tut, sodass er sich auch in umgebautem Upstream-Code
++   wieder einsetzen lässt. Danach die übrigen Patches anwenden:
++   ```bash
++   git apply --3way ../patches/distributed-rooms/000{2,3,4}-*.patch
++   ```
++3. Bauen, Unit-Tests und das Docker-Testsetup ausführen:
++   ```bash
++   go build ./... && go test ./pkg/distributed/ ./pkg/rtc/ ./pkg/routing/...
++   cd test/distributed && ./run-tests.sh
++   ```
++4. Patches für das neue Release neu erzeugen und die Patch-Ablage aktualisieren:
++   ```bash
++   patches/distributed-rooms/make-patches.sh v1.14.0
++   ```
++
++Kompilierfehler in `pkg/distributed` nach einem Upstream-Update entstehen typischerweise
++durch geänderte interne Schnittstellen (`types.Participant`, `types.MediaTrack`,
++`sfu.TrackSender`, `rtc.MediaTrackParams`). Der Compiler zeigt die fehlenden oder
++geänderten Methoden direkt an.
++
++## Einhängepunkte im Upstream-Code
++
++| Datei | Stelle | Zweck |
++|---|---|---|
++| `pkg/config/config.go` | `Config` | Feld `Distributed DistributedConfig` |
++| `pkg/routing/redisrouter.go` | Struct `RedisRouter` | Feld `placer ParticipantPlacer` |
++| | `GetNodeForRoom` | mit Placer: Node für den nächsten Teilnehmer statt fester Raum-Node |
++| | `StartParticipantSignal` | mit Placer: Node pro Teilnehmer |
++| `pkg/service/signal.go` | `HandleSession` | mit Placer: Session ohne „falscher RTC-Node“-Prüfung annehmen |
++| `pkg/service/roomallocator.go` | `SelectRoomNode` | Node-Limits führen im verteilten Modus nicht zur Ablehnung |
++| `pkg/service/roommanager.go` | Struct, `NewLocalRoomManager`, `Stop` | `distributed.Manager` erzeugen bzw. stoppen, Aufräum-Callback für ausgefallene Nodes |
++| | `getOrCreateRoom` | `PrepareRoomInternal` (Raum-Agents nur einmal), `AttachRoom`, `DetachRoom`, Telemetrie `RoomStarted`/`RoomEnded` nur auf erstem/letztem Node, Store nur vom letzten Node löschen |
++| | `OnParticipantChanged`, `OnRoomUpdated` | Änderungen an `distributed` melden; Remote-Teilnehmer nicht in den Room-Store schreiben |
++| | `ListParticipants`, `GetParticipant` | Remote-Teilnehmer einbeziehen |
++| `pkg/rtc/room.go` | Struct `Room` | Feld `distributed roomDistributedState` |
++| | `GetActiveSpeakers` | inkl. Remote-Teilnehmer (aufgeteilt in `getActiveSpeakers`) |
++| | `Join` | `max_participants` zählt Remote-Teilnehmer mit |
++| | `ResolveMediaTrack/DataTrackForSubscriber` | Berechtigung auch bei Remote-Publishern prüfen |
++| | `onUpdateSubscriptionPermission` | Berechtigungsänderung an andere Nodes melden |
++| | `createJoinResponseLocked` | Remote-Teilnehmer in `OtherParticipants` |
++| | `onTrackPublished` | keine Agents/Egress für Remote-Teilnehmer |
++| | `onDataMessage` | Data Packets an andere Nodes melden |
++| | `subscribeToExistingTracks` | Auto-Subscribe auch auf Remote-Tracks |
++| | `updateProto` | Teilnehmer-/Publisher-Zähler inkl. Remote |
++
++Die eigentliche Logik der Einhängepunkte steckt in neuen Dateien der jeweiligen Pakete
++(`*_distributed.go`, `distributed_hook.go`). Diese Dateien erzeugen keine Konflikte.
++
++## Regeln für Änderungen an der Erweiterung
++
++- Neue Logik in `pkg/distributed` oder in neue `*_distributed.go`-Dateien legen.
++- Upstream-Dateien nur mit kurzen Aufrufen erweitern und keinen Code verschieben,
++  umbenennen oder umformatieren.
++- Keine Änderungen an `github.com/livekit/protocol` und keine neuen Abhängigkeiten in
++  `go.mod`.
++- Nach Änderungen `make-patches.sh <base-tag>` ausführen und die Patches einchecken.
+diff --git a/docs/distributed-rooms/tests.md b/docs/distributed-rooms/tests.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..865179c6f3302147e21031e417747db9198f7460
+--- /dev/null
++++ b/docs/distributed-rooms/tests.md
+@@ -0,0 +1,100 @@
++# Tests
++
++## Unit-Tests
++
++```bash
++go test ./pkg/distributed/
++```
++
++Die Unit-Tests decken die Platzierung (Auffüllen, Überlaufen, alles voll, toter Node,
++CPU-Limit), Remote-Teilnehmer (Versionen, Berechtigungen, Sprecher-Timeout, Disconnect),
++die Kodierung der Relay-Stream-IDs und das Nachrichtenformat ab.
++
++Die bestehenden Upstream-Tests der geänderten Pakete laufen unverändert:
++
++```bash
++go test ./pkg/rtc/ ./pkg/routing/... ./pkg/config/ ./pkg/service/   # pkg/service braucht Docker (Redis)
++```
++
++## Lokales Test-Cluster mit Docker Compose
++
++`test/distributed/` enthält ein Cluster aus Redis und 3 LiveKit-Nodes, gebaut aus dem
++lokalen Quellcode:
++
++```bash
++cd test/distributed
++docker compose up -d --build          # Cluster starten
++./run-tests.sh                        # alle Szenarien, Exit-Code 0/1
++./run-tests.sh loadtest failover      # einzelne Szenarien
++KEEP=1 ./run-tests.sh loadtest        # Cluster danach nicht herunterfahren
++docker compose down
++```
++
++| Node | Signal/API | RTC TCP | RTC UDP | Relay (intern, UDP 7890–7989) |
++|---|---|---|---|---|
++| livekit-1 | ws://localhost:7880 | 7881 | 7882 | 172.28.0.11:7890 |
++| livekit-2 | ws://localhost:7980 | 7981 | 7982 | 172.28.0.12:7890 |
++| livekit-3 | ws://localhost:8080 | 8081 | 8082 | 172.28.0.13:7890 |
++
++API-Key `devkey`, Secret `secretsecretsecretsecretsecretsecret`.
++`MAX_PER_NODE` (Default 1) setzt `distributed.max_participants_per_node`, `LOG_LEVEL`
++die Log-Stufe, z. B. `MAX_PER_NODE=4 LOG_LEVEL=debug docker compose up -d`.
++
++### Szenarien von `run-tests.sh`
++
++| Szenario | Ablauf | Prüfungen |
++|---|---|---|
++| `go` | Go-E2E-Tests (`test/distributed/e2e_test.go`) gegen das Cluster mit `MAX_PER_NODE=1`. Braucht Go auf dem Host, sonst übersprungen. | 3 Teilnehmer auf 3 Nodes sehen sich. Audio und Video werden über Nodes empfangen, auch in beide Richtungen zwischen denselben Nodes, Data Packets kommen an, ein Austritt wird überall sichtbar. Node-Ausfall: Teilnehmer wird entfernt (Client und RoomService), Rejoin auf lebendem Node, Medien danach |
++| `loadtest` | `lk load-test` mit 3 Video-Publishern (Simulcast), 3 Audio-Publishern und 6 Subscribern über einen Node, `MAX_PER_NODE=4` | Teilnehmer auf ≥ 2 Nodes. Exit-Code von lk ist 0. Alle Tracks abonniert (sofern lk eine Zusammenfassung ausgibt). Tracks werden weitergeleitet, ohne Relay-Fehler |
++| `failover` | `lk load-test` läuft, ein Node mit Teilnehmern wird per `SIGKILL` beendet | Node aus dem Raum entfernt, keine Zuordnung mehr zum toten Node, Raum lebt weiter, neuer Teilnehmer (`lk room join`) landet auf lebendem Node |
++
++### lk CLI direkt verwenden
++
++Der Service `lk` (Profil `tools`) nutzt das Host-Netzwerk und ist auf livekit-1 vorkonfiguriert:
++
++```bash
++docker compose run --rm lk room list
++docker compose run --rm lk room participants list demo
++docker compose run --rm lk load-test --room demo --video-publishers 2 --subscribers 10 --duration 1m
++# über einen anderen Signal-Node
++docker compose run --rm lk --url ws://localhost:7980 room participants list demo
++```
++
++Die Verteilung eines Raums ist in Redis sichtbar:
++
++```bash
++docker compose exec redis redis-cli HGETALL dist:participant_node:demo
++```
++
++### Manueller Test im Browser
++
++1. Cluster starten. Mit dem Default `MAX_PER_NODE=1` landet jeder Tab auf einem eigenen Node:
++   `docker compose up -d --build`
++2. Tokens erzeugen (gültig 2 h):
++   ```bash
++   for id in alice bob carol; do
++     docker compose run --rm lk token create --join --room demo --identity $id --valid-for 2h
++   done
++   ```
++3. http://localhost:8090 in mehreren Tabs öffnen, jeweils einen Signal-Node wählen, ein
++   Token einfügen und verbinden.
++4. Erwartung: Alle Tabs sehen sich gegenseitig mit Video und Audio, die Sprecher-
++   Hervorhebung funktioniert, die Verteilung ist in Redis bzw. im Log
++   (`placed participant`) sichtbar.
++5. Ausfall testen: `docker compose kill livekit-2`. Teilnehmer auf diesem Node
++   verschwinden nach einigen Sekunden aus den anderen Tabs, ihr Tab verbindet sich neu.
++
++## Go-E2E-Tests gegen ein beliebiges Cluster
++
++```bash
++LIVEKIT_DISTRIBUTED_E2E=1 \
++LIVEKIT_NODE_URLS=ws://localhost:7880,ws://localhost:7980,ws://localhost:8080 \
++LIVEKIT_API_KEY=devkey LIVEKIT_API_SECRET=secretsecretsecretsecretsecretsecret \
++go test ./test/distributed/ -run TestDistributedRoom -v
++```
++
++Für `TestNodeFailure` zusätzlich `LIVEKIT_REDIS_ADDR`, `LIVEKIT_NODE_RELAY_ADDRS` (in der
++Reihenfolge der URLs) und `LIVEKIT_STOP_NODE_CMD` (z. B. `./test/distributed/stop-node.sh {node}`).
++Beide Tests erwarten `max_participants_per_node: 1`. Mit `LIVEKIT_E2E_SIGNALLING=v1` nutzen
++die Testclients die Single-PeerConnection-Signalisierung (`/rtc/v1`) aktueller Browser-SDKs
++statt der klassischen Signalisierung mit zwei PeerConnections.

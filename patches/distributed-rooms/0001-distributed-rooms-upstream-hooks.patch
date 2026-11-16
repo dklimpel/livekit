@@ -1,0 +1,746 @@
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 19a42518be361379098c4feaf6030060c272f7f2..4bcd1ddb67e76481007fdd0d9bdf5656ad9d53bb 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -121,6 +121,8 @@ type Config struct {
+ 	EnableParticipantDataBlob bool `yaml:"enable_participant_data_blob,omitempty"`
+ 
+ 	API APIConfig `yaml:"api,omitempty"`
++
++	Distributed DistributedConfig `yaml:"distributed,omitempty"`
+ }
+ 
+ // WebTransportConfig is the node's HTTP/3 listener. QUIC has no plaintext mode,
+diff --git a/pkg/config/distributed.go b/pkg/config/distributed.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..0491dc73656edbf57d01ff24c46279743788fd74
+--- /dev/null
++++ b/pkg/config/distributed.go
+@@ -0,0 +1,58 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package config
++
++import "time"
++
++// DistributedConfig enables hosting a single room on multiple nodes.
++// See docs/distributed-rooms for details. Requires Redis.
++type DistributedConfig struct {
++	// Enabled turns on distributed rooms. When false (default) the server
++	// behaves exactly like upstream LiveKit: one room is hosted by one node.
++	Enabled bool `yaml:"enabled,omitempty"`
++
++	// MaxParticipantsPerNode is the number of participants of a single room a
++	// node accepts before further participants of that room overflow to another
++	// node ("fill, then overflow"). 0 disables the participant based limit, in
++	// that case only node limits (limit.*, cpu_load_limit) trigger an overflow.
++	MaxParticipantsPerNode int `yaml:"max_participants_per_node,omitempty"`
++
++	// CPULoadLimit (0..1) marks a node as full for new participants when its
++	// reported CPU load exceeds the value. 0 disables the check.
++	CPULoadLimit float32 `yaml:"cpu_load_limit,omitempty"`
++
++	// NodeCheckInterval is how often a node checks the liveness of the other
++	// nodes of its distributed rooms. Defaults to 2s.
++	NodeCheckInterval time.Duration `yaml:"node_check_interval,omitempty"`
++
++	// Relay configures the node-to-node media relay.
++	Relay DistributedRelayConfig `yaml:"relay,omitempty"`
++}
++
++type DistributedRelayConfig struct {
++	// PortRangeStart/PortRangeEnd is the UDP port range of node-to-node relay
++	// connections. Every relay peer connection uses its own port: one per
++	// direction, room and remote node. Defaults to 7890-8889.
++	PortRangeStart uint16 `yaml:"port_range_start,omitempty"`
++	PortRangeEnd   uint16 `yaml:"port_range_end,omitempty"`
++
++	// Deprecated: a single shared port mixes up connections between the same
++	// two nodes. If set without a port range, it is used as port_range_start.
++	UDPPort uint32 `yaml:"udp_port,omitempty"`
++
++	// NodeIP is the IP other nodes use to reach this node's relay port.
++	// Defaults to the node IP (rtc.node_ip / auto detected).
++	NodeIP string `yaml:"node_ip,omitempty"`
++}
+diff --git a/pkg/routing/distributed_hook.go b/pkg/routing/distributed_hook.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f0b9cbf321a3301d979cbacb58eba927ab546cc
+--- /dev/null
++++ b/pkg/routing/distributed_hook.go
+@@ -0,0 +1,63 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package routing
++
++import (
++	"context"
++
++	"github.com/redis/go-redis/v9"
++
++	"github.com/livekit/protocol/livekit"
++)
++
++// ParticipantPlacer places participants of distributed rooms on nodes.
++// It is implemented by pkg/distributed and installed on the RedisRouter when
++// distributed rooms are enabled. Without a placer the router behaves like upstream.
++type ParticipantPlacer interface {
++	// NodeForParticipant selects the node hosting the participant's session.
++	NodeForParticipant(ctx context.Context, roomName livekit.RoomName, pi ParticipantInit) (livekit.NodeID, string, error)
++	// NodeForRoom returns the node that would host the next participant of the room.
++	NodeForRoom(ctx context.Context, roomName livekit.RoomName) (*livekit.Node, error)
++}
++
++// SetParticipantPlacer installs a placer, must be called before the router serves requests.
++func (r *RedisRouter) SetParticipantPlacer(p ParticipantPlacer) {
++	r.placer = p
++}
++
++// RedisClient exposes the Redis client used by the router.
++func (r *RedisRouter) RedisClient() redis.UniversalClient {
++	return r.rc
++}
++
++func (r *RedisRouter) startParticipantSignalWithPlacer(ctx context.Context, roomName livekit.RoomName, pi ParticipantInit) (StartParticipantSignalResults, error) {
++	nodeID, reason, err := r.placer.NodeForParticipant(ctx, roomName, pi)
++	if err != nil {
++		return StartParticipantSignalResults{}, err
++	}
++	res, err := r.StartParticipantSignalWithNodeID(ctx, roomName, pi, nodeID)
++	if err == nil {
++		res.NodeSelectionReason = reason
++	}
++	return res, err
++}
++
++// HasParticipantPlacer reports whether router places participants of a room on
++// multiple nodes. In that case a node must accept sessions for rooms that are
++// (primarily) hosted on another node.
++func HasParticipantPlacer(router Router) bool {
++	rr, ok := router.(*RedisRouter)
++	return ok && rr.placer != nil
++}
+diff --git a/pkg/routing/redisrouter.go b/pkg/routing/redisrouter.go
+index 44859b4dba52da05f4de3bbc6d96192ea8ed19ae..4966a62b458651cb59ea8759932e31a99d2a41c4 100644
+--- a/pkg/routing/redisrouter.go
++++ b/pkg/routing/redisrouter.go
+@@ -54,6 +54,8 @@ type RedisRouter struct {
+ 	isStarted atomic.Bool
+ 
+ 	cancel func()
++
++	placer ParticipantPlacer // distributed rooms, see distributed_hook.go
+ }
+ 
+ func NewRedisRouter(lr *LocalRouter, rc redis.UniversalClient, kps rpc.KeepalivePubSub) *RedisRouter {
+@@ -98,7 +100,10 @@ func (r *RedisRouter) RemoveDeadNodes() error {
+ }
+ 
+ // GetNodeForRoom finds the node where the room is hosted at
+-func (r *RedisRouter) GetNodeForRoom(_ context.Context, roomName livekit.RoomName) (*livekit.Node, error) {
++func (r *RedisRouter) GetNodeForRoom(ctx context.Context, roomName livekit.RoomName) (*livekit.Node, error) {
++	if r.placer != nil {
++		return r.placer.NodeForRoom(ctx, roomName)
++	}
+ 	nodeID, err := r.rc.HGet(r.ctx, NodeRoomKey, string(roomName)).Result()
+ 	if err == redis.Nil {
+ 		return nil, ErrNotFound
+@@ -161,6 +166,9 @@ func (r *RedisRouter) CreateRoom(ctx context.Context, req *livekit.CreateRoomReq
+ 
+ // StartParticipantSignal signal connection sets up paths to the RTC node, and starts to route messages to that message queue
+ func (r *RedisRouter) StartParticipantSignal(ctx context.Context, roomName livekit.RoomName, pi ParticipantInit) (res StartParticipantSignalResults, err error) {
++	if r.placer != nil {
++		return r.startParticipantSignalWithPlacer(ctx, roomName, pi)
++	}
+ 	rtcNode, err := r.GetNodeForRoom(ctx, roomName)
+ 	if err != nil {
+ 		return
+diff --git a/pkg/rtc/room.go b/pkg/rtc/room.go
+index a67adf75455ac9efd8ea2808fa307baa143152e0..6416f14960d818627a7512ac546c949a7993cade 100644
+--- a/pkg/rtc/room.go
++++ b/pkg/rtc/room.go
+@@ -152,6 +152,8 @@ type Room struct {
+ 	onStateChangeMu              sync.Mutex
+ 	localParticipantListener     types.LocalParticipantListener
+ 	participantTelemetryListener types.ParticipantTelemetryListener
++
++	distributed roomDistributedState // see room_distributed.go
+ }
+ 
+ type ParticipantOptions struct {
+@@ -381,7 +383,10 @@ func (r *Room) GetParticipantCount() int {
+ }
+ 
+ func (r *Room) GetActiveSpeakers() []*livekit.SpeakerInfo {
+-	participants := r.GetParticipants()
++	return r.getActiveSpeakers(r.getParticipantsIncludingRemote())
++}
++
++func (r *Room) getActiveSpeakers(participants []types.Participant) []*livekit.SpeakerInfo {
+ 	speakers := make([]*livekit.SpeakerInfo, 0, len(participants))
+ 	for _, p := range participants {
+ 		level, active := p.GetAudioLevel()
+@@ -456,7 +461,7 @@ func (r *Room) Join(
+ 		return ErrAlreadyJoined
+ 	}
+ 	if r.protoRoom.MaxParticipants > 0 && !participant.IsDependent() {
+-		numParticipants := uint32(0)
++		numParticipants := r.numRemoteParticipantsLocked()
+ 		for _, p := range r.participants {
+ 			if !p.IsDependent() {
+ 				numParticipants++
+@@ -710,6 +715,7 @@ func (r *Room) onUpdateSubscriptionPermission(participant types.LocalParticipant
+ 	for _, track := range participant.GetPublishedDataTracks() {
+ 		r.trackManager.NotifyTrackChanged(track.ID())
+ 	}
++	r.notifyDistributedPermissionChanged(participant)
+ 	return nil
+ }
+ 
+@@ -728,7 +734,7 @@ func (r *Room) ResolveMediaTrackForSubscriber(sub types.LocalParticipant, trackI
+ 	res.PublisherIdentity = info.PublisherIdentity
+ 	res.PublisherID = info.PublisherID
+ 
+-	pub := r.GetParticipantByID(info.PublisherID)
++	pub := r.getParticipantByIDIncludingRemote(info.PublisherID)
+ 	// when publisher is not found, we will assume it doesn't have permission to access
+ 	if pub != nil {
+ 		res.HasPermission = IsParticipantExemptFromTrackPermissionsRestrictions(sub) || pub.HasPermission(trackID, sub.Identity())
+@@ -752,7 +758,7 @@ func (r *Room) ResolveDataTrackForSubscriber(sub types.LocalParticipant, trackID
+ 	res.PublisherIdentity = info.PublisherIdentity
+ 	res.PublisherID = info.PublisherID
+ 
+-	pub := r.GetParticipantByID(info.PublisherID)
++	pub := r.getParticipantByIDIncludingRemote(info.PublisherID)
+ 	// when publisher is not found, we will assume it doesn't have permission to access
+ 	if pub != nil {
+ 		res.HasPermission = IsParticipantExemptFromTrackPermissionsRestrictions(sub) || pub.HasPermission(trackID, sub.Identity())
+@@ -1053,7 +1059,7 @@ func (r *Room) createJoinResponseLocked(
+ 		OtherParticipants: GetOtherParticipantInfo(
+ 			participant,
+ 			false, // isMigratingIn
+-			toParticipants(slices.Collect(maps.Values(r.participants))),
++			r.appendRemoteParticipantsLocked(toParticipants(slices.Collect(maps.Values(r.participants)))),
+ 			false, // skipSubscriberBroadcast
+ 		),
+ 		IceServers: iceServers,
+@@ -1109,6 +1115,11 @@ func (r *Room) onTrackPublished(participant types.Participant, track types.Media
+ 		onParticipantChanged(participant)
+ 	}
+ 
++	if IsRemoteParticipant(participant) {
++		// agents and egress are launched by the node hosting the publisher
++		return
++	}
++
+ 	// launch jobs
+ 	r.lock.Lock()
+ 	hasPublished := r.hasPublished[participant.Identity()]
+@@ -1304,6 +1315,7 @@ func (r *Room) onDataMessage(source types.LocalParticipant, kind livekit.DataPac
+ 		}, len(data))
+ 	}
+ 	BroadcastDataPacketForRoom(r, source, kind, dp, r.logger)
++	r.notifyDistributedLocalData(source, kind, dp)
+ }
+ 
+ func (r *Room) onDataMessageUnlabeled(source types.LocalParticipant, data []byte) {
+@@ -1509,7 +1521,7 @@ func (r *Room) subscribeToExistingTracks(p types.LocalParticipant, isSync bool)
+ 	r.lock.RUnlock()
+ 
+ 	var trackIDs []livekit.TrackID
+-	for _, op := range r.GetParticipants() {
++	for _, op := range r.getParticipantsIncludingRemote() {
+ 		if p.ID() == op.ID() {
+ 			// don't send to itself
+ 			continue
+@@ -1601,6 +1613,7 @@ func (r *Room) updateProto() *livekit.Room {
+ 			room.NumPublishers++
+ 		}
+ 	}
++	r.addRemoteParticipantCounts(room)
+ 
+ 	return room
+ }
+diff --git a/pkg/rtc/room_distributed.go b/pkg/rtc/room_distributed.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef033b449b0574aa352a7f5b62279ff7c8eb30c0
+--- /dev/null
++++ b/pkg/rtc/room_distributed.go
+@@ -0,0 +1,244 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package rtc
++
++import (
++	"maps"
++	"slices"
++
++	"github.com/pion/webrtc/v4"
++
++	"github.com/livekit/protocol/livekit"
++
++	"github.com/livekit/livekit-server/pkg/rtc/types"
++)
++
++// Distributed rooms (pkg/distributed) mirror participants hosted on other nodes
++// into the local room. This file holds the room side of that integration, so
++// that the changes to room.go stay small.
++
++// RemoteNodeParticipant is implemented by participants hosted on another node.
++type RemoteNodeParticipant interface {
++	types.Participant
++	IsRemoteNodeParticipant() bool
++}
++
++// IsRemoteParticipant reports whether p is hosted on another node.
++func IsRemoteParticipant(p types.Participant) bool {
++	rp, ok := p.(RemoteNodeParticipant)
++	return ok && rp.IsRemoteNodeParticipant()
++}
++
++// DistributedRoomListener receives events of the local room that need to be
++// propagated to the other nodes of a distributed room.
++type DistributedRoomListener interface {
++	// OnLocalDataPacket is called for data packets sent by local participants or
++	// by the server API on this node.
++	OnLocalDataPacket(source types.LocalParticipant, kind livekit.DataPacket_Kind, dp *livekit.DataPacket)
++	// OnLocalSubscriptionPermissionChanged is called when a local participant
++	// changed the subscription permissions of its tracks.
++	OnLocalSubscriptionPermissionChanged(p types.LocalParticipant)
++}
++
++type roomDistributedState struct {
++	listener           DistributedRoomListener
++	remoteParticipants map[livekit.ParticipantIdentity]RemoteNodeParticipant
++}
++
++// SetDistributedListener installs the listener of a distributed room.
++func (r *Room) SetDistributedListener(l DistributedRoomListener) {
++	r.lock.Lock()
++	r.distributed.listener = l
++	r.lock.Unlock()
++}
++
++// GetRemoteParticipant returns a participant hosted on another node.
++func (r *Room) GetRemoteParticipant(identity livekit.ParticipantIdentity) RemoteNodeParticipant {
++	r.lock.RLock()
++	defer r.lock.RUnlock()
++	return r.distributed.remoteParticipants[identity]
++}
++
++// GetRemoteParticipants returns the participants hosted on other nodes.
++func (r *Room) GetRemoteParticipants() []RemoteNodeParticipant {
++	r.lock.RLock()
++	defer r.lock.RUnlock()
++	return slices.Collect(maps.Values(r.distributed.remoteParticipants))
++}
++
++// AddRemoteParticipant adds (or replaces) a participant hosted on another node
++// and announces it to the local participants.
++func (r *Room) AddRemoteParticipant(p RemoteNodeParticipant) {
++	r.lock.Lock()
++	if r.distributed.remoteParticipants == nil {
++		r.distributed.remoteParticipants = make(map[livekit.ParticipantIdentity]RemoteNodeParticipant)
++	}
++	r.distributed.remoteParticipants[p.Identity()] = p
++	r.lock.Unlock()
++
++	r.protoProxy.MarkDirty(false)
++	r.UpdateRemoteParticipant(p)
++}
++
++// UpdateRemoteParticipant announces a state change of a remote participant.
++func (r *Room) UpdateRemoteParticipant(p RemoteNodeParticipant) {
++	// subscribers re-evaluate permissions on track changes
++	for _, t := range p.GetPublishedTracks() {
++		r.trackManager.NotifyTrackChanged(t.ID())
++	}
++	r.broadcastParticipantState(p, broadcastOptions{skipSource: true, immediate: true})
++	if r.onParticipantChanged != nil {
++		r.onParticipantChanged(p)
++	}
++}
++
++// RemoveRemoteParticipant removes a participant hosted on another node.
++// p.ToProto() is expected to report the participant as DISCONNECTED.
++func (r *Room) RemoveRemoteParticipant(p RemoteNodeParticipant) {
++	r.lock.Lock()
++	if r.distributed.remoteParticipants[p.Identity()] != p {
++		r.lock.Unlock()
++		return
++	}
++	delete(r.distributed.remoteParticipants, p.Identity())
++	r.lock.Unlock()
++
++	for _, t := range p.GetPublishedTracks() {
++		r.trackManager.RemoveTrack(t)
++	}
++	r.protoProxy.MarkDirty(false)
++	r.broadcastParticipantState(p, broadcastOptions{skipSource: true, immediate: true})
++	if r.onParticipantChanged != nil {
++		r.onParticipantChanged(p)
++	}
++}
++
++// AddRemoteTrack publishes a track of a remote participant in the local room,
++// auto-subscribing local participants.
++func (r *Room) AddRemoteTrack(p RemoteNodeParticipant, track types.MediaTrack) {
++	r.onTrackPublished(p, track)
++}
++
++// RemoveRemoteTrack unpublishes a track of a remote participant.
++func (r *Room) RemoveRemoteTrack(p RemoteNodeParticipant, track types.MediaTrack) {
++	r.onTrackUnpublished(p, track)
++}
++
++// DeliverRemoteDataPacket delivers a data packet received from another node to
++// the local participants.
++func (r *Room) DeliverRemoteDataPacket(kind livekit.DataPacket_Kind, dp *livekit.DataPacket) {
++	BroadcastDataPacketForRoom(r, nil, kind, dp, r.logger)
++}
++
++// SendRemoteSpeakerChanges forwards active speaker changes of remote participants.
++func (r *Room) SendRemoteSpeakerChanges(speakers []*livekit.SpeakerInfo) {
++	if len(speakers) != 0 {
++		r.sendSpeakerChanges(speakers)
++	}
++}
++
++// GetLocalActiveSpeakers returns the active speakers among the local participants.
++func (r *Room) GetLocalActiveSpeakers() []*livekit.SpeakerInfo {
++	return r.getActiveSpeakers(toParticipants(r.GetParticipants()))
++}
++
++// --- helpers used by room.go ---
++
++func (r *Room) notifyDistributedLocalData(source types.LocalParticipant, kind livekit.DataPacket_Kind, dp *livekit.DataPacket) {
++	r.lock.RLock()
++	l := r.distributed.listener
++	r.lock.RUnlock()
++	if l != nil {
++		l.OnLocalDataPacket(source, kind, dp)
++	}
++}
++
++func (r *Room) notifyDistributedPermissionChanged(p types.LocalParticipant) {
++	r.lock.RLock()
++	l := r.distributed.listener
++	r.lock.RUnlock()
++	if l != nil {
++		l.OnLocalSubscriptionPermissionChanged(p)
++	}
++}
++
++// GetParticipantIdentityByID resolves a participant ID of a local or remote participant.
++func (r *Room) GetParticipantIdentityByID(participantID livekit.ParticipantID) livekit.ParticipantIdentity {
++	if p := r.getParticipantByIDIncludingRemote(participantID); p != nil {
++		return p.Identity()
++	}
++	return ""
++}
++
++// appendRemoteParticipantsLocked, r.lock must be held
++func (r *Room) appendRemoteParticipantsLocked(participants []types.Participant) []types.Participant {
++	for _, p := range r.distributed.remoteParticipants {
++		participants = append(participants, p)
++	}
++	return participants
++}
++
++// numRemoteParticipantsLocked, r.lock must be held
++func (r *Room) numRemoteParticipantsLocked() uint32 {
++	n := uint32(0)
++	for _, p := range r.distributed.remoteParticipants {
++		if !p.IsDependent() {
++			n++
++		}
++	}
++	return n
++}
++
++func (r *Room) getParticipantByIDIncludingRemote(participantID livekit.ParticipantID) types.Participant {
++	if p := r.GetParticipantByID(participantID); p != nil {
++		return p
++	}
++	r.lock.RLock()
++	defer r.lock.RUnlock()
++	for _, p := range r.distributed.remoteParticipants {
++		if p.ID() == participantID {
++			return p
++		}
++	}
++	return nil
++}
++
++func (r *Room) getParticipantsIncludingRemote() []types.Participant {
++	r.lock.RLock()
++	defer r.lock.RUnlock()
++	return r.appendRemoteParticipantsLocked(toParticipants(slices.Collect(maps.Values(r.participants))))
++}
++
++func (r *Room) addRemoteParticipantCounts(room *livekit.Room) {
++	r.lock.RLock()
++	defer r.lock.RUnlock()
++	for _, p := range r.distributed.remoteParticipants {
++		if !p.IsDependent() {
++			room.NumParticipants++
++		}
++		if p.IsPublisher() {
++			room.NumPublishers++
++		}
++	}
++}
++
++// NewRelayMediaEngine creates the media engine of node-to-node relay
++// connections of distributed rooms. It registers the same codecs and header
++// extensions as publisher connections, so every published stream can be relayed.
++func NewRelayMediaEngine(codecs []*livekit.Codec, conf *WebRTCConfig) (*webrtc.MediaEngine, error) {
++	dc := conf.Publisher
++	dc.FlexFEC = FlexFECDirectionConfig{}
++	return createMediaEngine(codecs, dc, false)
++}
+diff --git a/pkg/service/roomallocator.go b/pkg/service/roomallocator.go
+index 6beb00c0957614a1cf1ed86b544b00a218d6ee0e..df61aa4f701aa144b651bfee3374ced09c173ab9 100644
+--- a/pkg/service/roomallocator.go
++++ b/pkg/service/roomallocator.go
+@@ -143,7 +143,8 @@ func (r *StandardRoomAllocator) SelectRoomNode(ctx context.Context, roomName liv
+ 	// if already assigned and still available, keep it on that node
+ 	if err == nil && selector.IsAvailable(existing) {
+ 		// if node hosting the room is full, deny entry
+-		if selector.LimitsReached(r.config.Limit, existing.Stats) {
++		// distributed rooms overflow to other nodes instead
++		if selector.LimitsReached(r.config.Limit, existing.Stats) && !r.config.Distributed.Enabled {
+ 			return routing.ErrNodeLimitReached
+ 		}
+ 
+diff --git a/pkg/service/roommanager.go b/pkg/service/roommanager.go
+index 6a70c6b1138fb578a65722f4476fb718df732005..3a255bb5754b15861d825eaece3bf760d0df2d33 100644
+--- a/pkg/service/roommanager.go
++++ b/pkg/service/roommanager.go
+@@ -50,6 +50,7 @@ import (
+ 
+ 	"github.com/livekit/livekit-server/pkg/clientconfiguration"
+ 	"github.com/livekit/livekit-server/pkg/config"
++	"github.com/livekit/livekit-server/pkg/distributed"
+ 	"github.com/livekit/livekit-server/pkg/routing"
+ 	"github.com/livekit/livekit-server/pkg/rtc"
+ 	"github.com/livekit/livekit-server/pkg/rtc/types"
+@@ -105,6 +106,8 @@ type RoomManager struct {
+ 
+ 	subscribePacer *rtc.SubscribePacer
+ 
++	distributed *distributed.Manager // nil unless distributed rooms are enabled
++
+ 	rpc.UnimplementedParticipantServer
+ 	rpc.UnimplementedRoomServer
+ 	rpc.UnimplementedRoomManagerServer
+@@ -182,6 +185,11 @@ func NewLocalRoomManager(
+ 		return nil, err
+ 	}
+ 
++	if r.distributed, err = distributed.NewManager(conf, rtcConf, currentNode, router, bus); err != nil {
++		return nil, err
++	}
++	r.distributed.OnFailedNodeParticipant(r.cleanupFailedNodeParticipant)
++
+ 	return r, nil
+ }
+ 
+@@ -251,6 +259,7 @@ func (r *RoomManager) Stop() {
+ 	for _, room := range rooms {
+ 		room.Close(types.RoomCloseReasonServerShutdown)
+ 	}
++	r.distributed.Stop()
+ 
+ 	r.roomManagerServer.Kill()
+ 	r.whipServer.Kill()
+@@ -682,6 +691,8 @@ func (r *RoomManager) getOrCreateRoom(ctx context.Context, createRoom *livekit.C
+ 		currentRoom = r.rooms[roomName]
+ 	}
+ 
++	internal = r.distributed.PrepareRoomInternal(ctx, roomName, internal)
++
+ 	// construct ice servers
+ 	newRoom := rtc.NewRoom(ri, internal, *r.rtcConfig, r.config.Room, &r.config.Audio, r.serverInfo, r.telemetry, r.agentClient, r.agentStore, r.egressLauncher)
+ 
+@@ -707,22 +718,35 @@ func (r *RoomManager) getOrCreateRoom(ctx context.Context, createRoom *livekit.C
+ 		killDispServer()
+ 
+ 		roomInfo := newRoom.ToProto()
+-		r.telemetry.RoomEnded(ctx, roomInfo, reason.ToProto())
++		// a distributed room ends when its last node closes it
++		lastNode := r.distributed.DetachRoom(ctx, newRoom, reason)
++		if lastNode {
++			r.telemetry.RoomEnded(ctx, roomInfo, reason.ToProto())
++		}
+ 		prometheus.RoomEnded(time.Unix(roomInfo.CreationTime, 0))
+-		if err := r.deleteRoom(ctx, roomName); err != nil {
+-			newRoom.Logger().Errorw("could not delete room", err)
++		if lastNode {
++			if err := r.deleteRoom(ctx, roomName); err != nil {
++				newRoom.Logger().Errorw("could not delete room", err)
++			}
++		} else {
++			r.removeLocalRoom(newRoom)
+ 		}
+ 
+ 		newRoom.Logger().Infow("room closed")
+ 	})
+ 
+ 	newRoom.OnRoomUpdated(func() {
++		r.distributed.OnRoomUpdated(newRoom)
+ 		if err := r.roomStore.StoreRoom(ctx, newRoom.ToProto(), newRoom.Internal()); err != nil {
+ 			newRoom.Logger().Errorw("could not handle metadata update", err)
+ 		}
+ 	})
+ 
+ 	newRoom.OnParticipantChanged(func(p types.Participant) {
++		r.distributed.OnParticipantChanged(newRoom, p)
++		if rtc.IsRemoteParticipant(p) {
++			return
++		}
+ 		if !p.IsDisconnected() {
+ 			if err := r.roomStore.StoreParticipant(ctx, roomName, p.ToProto()); err != nil {
+ 				newRoom.Logger().Errorw("could not handle participant change", err)
+@@ -734,9 +758,13 @@ func (r *RoomManager) getOrCreateRoom(ctx context.Context, createRoom *livekit.C
+ 
+ 	r.lock.Unlock()
+ 
++	firstNode := r.distributed.AttachRoom(ctx, newRoom)
++
+ 	newRoom.Hold()
+ 
+-	r.telemetry.RoomStarted(ctx, newRoom.ToProto())
++	if firstNode {
++		r.telemetry.RoomStarted(ctx, newRoom.ToProto())
++	}
+ 	prometheus.RoomStarted()
+ 
+ 	if created && createRoom.GetEgress().GetRoom() != nil {
+@@ -838,6 +866,9 @@ func (r *RoomManager) ListParticipants(ctx context.Context, req *livekit.ListPar
+ 	for _, p := range participants {
+ 		items = append(items, p.ToProto())
+ 	}
++	for _, p := range room.GetRemoteParticipants() {
++		items = append(items, p.ToProto())
++	}
+ 
+ 	return &livekit.ListParticipantsResponse{
+ 		Participants: items,
+@@ -852,6 +883,9 @@ func (r *RoomManager) GetParticipant(ctx context.Context, req *livekit.RoomParti
+ 
+ 	participant := room.GetParticipant(livekit.ParticipantIdentity(req.Identity))
+ 	if participant == nil {
++		if rp := room.GetRemoteParticipant(livekit.ParticipantIdentity(req.Identity)); rp != nil {
++			return rp.ToProto(), nil
++		}
+ 		return nil, ErrParticipantNotFound
+ 	}
+ 
+diff --git a/pkg/service/roommanager_distributed.go b/pkg/service/roommanager_distributed.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..11712137cacc330a23028ea16885cd3e254188dc
+--- /dev/null
++++ b/pkg/service/roommanager_distributed.go
+@@ -0,0 +1,49 @@
++// Copyright 2026 LiveKit, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package service
++
++import (
++	"context"
++
++	"github.com/livekit/protocol/livekit"
++	"github.com/livekit/protocol/logger"
++
++	"github.com/livekit/livekit-server/pkg/rtc"
++)
++
++// removeLocalRoom forgets a closed room on this node without deleting the
++// cluster wide room state, which is still used by other nodes of a distributed room.
++func (r *RoomManager) removeLocalRoom(room *rtc.Room) {
++	r.lock.Lock()
++	if r.rooms[room.Name()] == room {
++		delete(r.rooms, room.Name())
++	}
++	r.lock.Unlock()
++}
++
++// cleanupFailedNodeParticipant removes a participant of a failed node from the
++// room store, unless the identity has rejoined with a new session meanwhile.
++func (r *RoomManager) cleanupFailedNodeParticipant(ctx context.Context, roomName livekit.RoomName, pi *livekit.ParticipantInfo) {
++	identity := livekit.ParticipantIdentity(pi.Identity)
++	if store, ok := r.roomStore.(OSSServiceStore); ok {
++		stored, err := store.LoadParticipant(ctx, roomName, identity)
++		if err != nil || stored.Sid != pi.Sid {
++			return
++		}
++	}
++	if err := r.roomStore.DeleteParticipant(ctx, roomName, identity); err != nil {
++		logger.Warnw("could not delete participant of failed node", err, "room", roomName, "participant", identity)
++	}
++}
+diff --git a/pkg/service/signal.go b/pkg/service/signal.go
+index 235c53a115a9aa525a5b1cf35cc2b695bd068816..7e755ebe09cae74cf59db05ba179380a77bb8333 100644
+--- a/pkg/service/signal.go
++++ b/pkg/service/signal.go
+@@ -100,6 +100,11 @@ func (s *defaultSessionHandler) HandleSession(
+ ) error {
+ 	prometheus.IncrementParticipantRtcInit(1)
+ 
++	if routing.HasParticipantPlacer(s.router) {
++		// distributed rooms: the participant was placed on this node by the signal node
++		return s.roomManager.StartSession(ctx, pi, requestSource, responseSink, false)
++	}
++
+ 	rtcNode, err := s.router.GetNodeForRoom(ctx, livekit.RoomName(pi.CreateRoom.Name))
+ 	if err != nil {
+ 		return err
